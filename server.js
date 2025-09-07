@@ -203,6 +203,15 @@ app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
 // --- API Routes ---
 
 // Root endpoint - API status
+// Add this new endpoint to your server.js to create the default admin
+app.get('/api/seed-admin', async (req, res) => {
+    try {
+        await initializeDefaultAdmin(); // This re-uses the function you already wrote
+        res.status(200).send('Default admin creation process completed. You can now log in.');
+    } catch (error) {
+        res.status(500).send('Failed to seed admin.');
+    }
+});
 app.get('/', (req, res) => {
     res.json({ 
         message: 'SportsHub Backend API', 
