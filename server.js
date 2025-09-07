@@ -459,6 +459,63 @@ app.post('/api/profile/update', async (req, res) => {
         res.status(500).json({ message: "Failed to update profile." });
     }
 });
+// Add this temporary endpoint after your existing routes
+app.post('/api/admin/reset-events', async (req, res) => {
+    try {
+        // Clear existing events
+        await eventsCollection.deleteMany({});
+        
+        // Add fresh events
+        const defaultEvents = [
+            {
+                id: 1,
+                name: "Cricket Intercollege Championship",
+                date: "2025-10-12",
+                location: "Main Cricket Ground",
+                time: "09:00 AM",
+                category: "Cricket",
+                emoji: "🏏",
+                difficulty: "Advanced",
+                team: {
+                    name: "Warriors",
+                    maxSlots: 11,
+                    members: ["Aditya Kumar"],
+                    requirements: {
+                        minRegNumber: "2020",
+                        minExperience: 2
+                    }
+                },
+                createdAt: new Date()
+            },
+            {
+                id: 2,
+                name: "Annual Badminton Tournament",
+                date: "2025-11-08",
+                location: "Indoor Sports Hall",
+                time: "10:00 AM",
+                category: "Badminton",
+                emoji: "🏸",
+                difficulty: "Intermediate",
+                team: {
+                    name: "Shuttlers",
+                    maxSlots: 4,
+                    members: ["Rahul Patel"],
+                    requirements: {
+                        minRegNumber: "2021",
+                        minExperience: 1
+                    }
+                },
+                createdAt: new Date()
+            }
+        ];
+        
+        await eventsCollection.insertMany(defaultEvents);
+        res.json({ message: "Events reset successfully!", count: defaultEvents.length });
+    } catch (error) {
+        res.status(500).json({ message: "Failed to reset events", error: error.message });
+    }
+});
+
 
 // Get chat messages for a team
 app.get('/api/chat/:teamName', async (req, res) => {
