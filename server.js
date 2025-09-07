@@ -666,6 +666,67 @@ app.post('/api/admin/login', async (req, res) => {
         res.status(500).json({ message: "Server error during admin login." });
     }
 });
+// NEW: Admin endpoint to create a new event
+app.post('/api/admin/events', async (req, res) => {
+    try {
+        const eventData = req.body;
+        
+        if (!eventData.name || !eventData.teamName) {
+            return res.status(400).json({ message: 'Event Name and Team Name are required.' });
+        }
+
+        const newEvent = {
+            id: await eventsCollection.countDocuments() + 1, // Simple auto-incrementing ID
+            name: eventData.name,
+            date: eventData.date,
+            location: eventData.location,
+            time: eventData.time,
+            category: eventData.category,
+            emoji: eventData.emoji,
+            difficulty: eventData.difficulty,
+            team: {
+                name: eventData.teamName,
+                maxSlots: parseInt(eventData.maxSlots),
+                members: [],
+                requirements: {
+                    minRegNumber: eventData.minRegYear,
+                    minExperience: parseInt(eventData.minExperience)
+                }
+            },
+            createdAt: new Date()
+        };
+
+        await eventsCollection.insertOne(newEvent);
+        console.log('Admin created new event:', newEvent.name);
+        res.status(201).json({ message: 'Event created successfully!', event: newEvent });
+
+    } catch (error) {
+        console.error('Error creating event:', error);
+        res.status(500).json({ message: 'Failed to create event.' });
+    }
+});
+// NEW: Admin endpoint to delete an event
+app.delete('/api/admin/events/:eventId', async (req, res) => {
+    try {
+        const eventId = parseInt(req.params.eventId);
+        if (isNaN(eventId)) {
+            return res.status(400).json({ message: 'Invalid Event ID.' });
+        }
+
+        const result = await eventsCollection.deleteOne({ id: eventId });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: 'Event not found.' });
+        }
+        
+        console.log('Admin deleted event with ID:', eventId);
+        res.status(200).json({ message: 'Event deleted successfully.' });
+
+    } catch (error) {
+        console.error('Error deleting event:', error);
+        res.status(500).json({ message: 'Failed to delete event.' });
+    }
+});
 
 // Get all users (Admin only)
 app.get('/api/admin/users', async (req, res) => {
