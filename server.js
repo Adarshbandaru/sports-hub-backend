@@ -11,7 +11,7 @@ const { MongoClient, ObjectId } = require('mongodb');
 
 // --- App Setup ---
 const app = express();
-const port = 3000;
+const port = process.env.PORT || 3000;
 
 // --- MongoDB Atlas Configuration ---
 const MONGODB_URI = 'mongodb+srv://sportsHubAdmin:Adarsh6708@csports-hub-cluster.on9cz2d.mongodb.net/sports-hub-db?retryWrites=true&w=majority&appName=Csports-hub-cluster';
@@ -187,7 +187,20 @@ async function initializeDefaultEvents() {
 }
 
 // --- Middleware ---
-app.use(cors({     origin: [         'http://localhost:3000',         'https://sportsmanagementsystem.netlify.app'     ],     credentials: true }));
+app.use(cors({
+    origin: [
+        'http://localhost:3000',
+        'https://sportsmanagementsystem.netlify.app',
+        'https://*.netlify.app'
+    ],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
+    credentials: true
+}));
+
+// Handle preflight requests
+app.options('*', cors());
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
 
@@ -197,7 +210,18 @@ app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
 app.get('/api/events', async (req, res) => {
     try {
         const events = await eventsCollection.find({}).sort({ id: 1 }).toArray();
-        res.json(events);
+        
+        // Ensure all events have proper IDs
+        const eventsWithIds = events.map((event, index) => {
+            if (!event.id && event.id !== 0) {
+                console.warn(`Event missing ID, assigning ID: ${index + 1}`, event.name);
+                event.id = index + 1;
+            }
+            return event;
+        });
+        
+        console.log(`Returning ${eventsWithIds.length} events to frontend`);
+        res.json(eventsWithIds);
     } catch (error) {
         console.error('Error fetching events:', error);
         res.status(500).json({ message: 'Failed to fetch events' });
@@ -208,6 +232,11 @@ app.get('/api/events', async (req, res) => {
 app.post('/api/register', async (req, res) => {
     try {
         const { fullName, studentID, email, password } = req.body;
+        
+        // Validate required fields
+        if (!fullName || !studentID || !email || !password) {
+            return res.status(400).json({ message: "All fields are required." });
+        }
         
         // Check if user already exists
         const existingUser = await usersCollection.findOne({
@@ -268,6 +297,11 @@ app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         
+        // Validate required fields
+        if (!email || !password) {
+            return res.status(400).json({ message: "Email and password are required." });
+        }
+        
         // Find user by email
         const user = await usersCollection.findOne({ email: email });
         if (!user) {
@@ -318,16 +352,38 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Join event team
+// Join event team - FIXED VERSION
 app.post('/api/events/:eventId/join', async (req, res) => {
     try {
         const { eventId } = req.params;
         const { userFullName, userRegNumber, userExperience } = req.body;
         
-        // Find the event
-        const event = await eventsCollection.findOne({ id: parseInt(eventId) });
-        if (!event || !event.team) {
-            return res.status(404).json({ message: 'Event or team not found.' });
+        // Enhanced debugging
+        console.log('Join request - Event ID:', eventId);
+        console.log('Join request - User:', userFullName);
+        console.log('Join request - RegNumber:', userRegNumber);
+        console.log('Join request - Experience:', userExperience);
+        
+        // Validate required fields
+        if (!userFullName || !userRegNumber || userExperience === undefined) {
+            return res.status(400).json({ message: 'All fields are required.' });
+        }
+        
+        // Convert eventId to integer and find the event
+        const eventIdInt = parseInt(eventId);
+        if (isNaN(eventIdInt)) {
+            return res.status(400).json({ message: 'Invalid event ID format.' });
+        }
+        
+        const event = await eventsCollection.findOne({ id: eventIdInt });
+        console.log('Found event:', event ? event.name : 'No event found');
+        
+        if (!event) {
+            return res.status(404).json({ message: 'Event not found.' });
+        }
+        
+        if (!event.team) {
+            return res.status(404).json({ message: 'Team information not found for this event.' });
         }
         
         // Check if user is already in the team
@@ -337,12 +393,19 @@ app.post('/api/events/:eventId/join', async (req, res) => {
         
         // Validate requirements
         const { requirements } = event.team;
-        if (parseInt(userRegNumber.substring(0, 4)) > parseInt(requirements.minRegNumber)) {
-            return res.status(400).json({ message: 'Application rejected. You are not senior enough.' });
+        const userRegYear = parseInt(userRegNumber.substring(0, 4));
+        const minRegYear = parseInt(requirements.minRegNumber);
+        
+        if (userRegYear > minRegYear) {
+            return res.status(400).json({ 
+                message: `Application rejected. Minimum registration year is ${requirements.minRegNumber}.` 
+            });
         }
         
         if (userExperience < requirements.minExperience) {
-            return res.status(400).json({ message: 'Application rejected. Not enough experience.' });
+            return res.status(400).json({ 
+                message: `Application rejected. Minimum ${requirements.minExperience} years of experience required.` 
+            });
         }
         
         if (event.team.members.length >= event.team.maxSlots) {
@@ -350,21 +413,25 @@ app.post('/api/events/:eventId/join', async (req, res) => {
         }
         
         // Add user to team
-        await eventsCollection.updateOne(
-            { id: parseInt(eventId) },
+        const updateResult = await eventsCollection.updateOne(
+            { id: eventIdInt },
             { 
                 $push: { "team.members": userFullName },
                 $set: { updatedAt: new Date() }
             }
         );
         
+        if (updateResult.matchedCount === 0) {
+            return res.status(404).json({ message: 'Failed to update event.' });
+        }
+        
         // Update user's joined teams
-        await usersCollection.updateOne(
+        const userUpdateResult = await usersCollection.updateOne(
             { fullName: userFullName },
             { 
                 $push: { 
                     joinedTeams: {
-                        eventId: parseInt(eventId),
+                        eventId: eventIdInt,
                         eventName: event.name,
                         teamName: event.team.name,
                         emoji: event.emoji,
@@ -375,11 +442,12 @@ app.post('/api/events/:eventId/join', async (req, res) => {
             }
         );
         
-        console.log(`${userFullName} joined ${event.team.name}`);
+        console.log(`${userFullName} successfully joined ${event.team.name}`);
         res.json({ message: `Successfully joined ${event.team.name}!` });
+        
     } catch (error) {
         console.error('Join team error:', error);
-        res.status(500).json({ message: 'Failed to join team.' });
+        res.status(500).json({ message: 'Failed to join team. Please try again.' });
     }
 });
 
@@ -387,6 +455,11 @@ app.post('/api/events/:eventId/join', async (req, res) => {
 app.post('/api/teams/leave', async (req, res) => {
     try {
         const { userFullName, teamName } = req.body;
+        
+        // Validate required fields
+        if (!userFullName || !teamName) {
+            return res.status(400).json({ message: "User name and team name are required." });
+        }
         
         // Find and update the event
         const updateResult = await eventsCollection.updateOne(
@@ -427,12 +500,17 @@ app.post('/api/profile/update', async (req, res) => {
     try {
         const { email, fullName, mobileNumber } = req.body;
         
+        // Validate required fields
+        if (!email || !fullName) {
+            return res.status(400).json({ message: "Email and full name are required." });
+        }
+        
         const updateResult = await usersCollection.findOneAndUpdate(
             { email: email },
             { 
                 $set: { 
                     fullName: fullName,
-                    mobileNumber: mobileNumber,
+                    mobileNumber: mobileNumber || "",
                     updatedAt: new Date()
                 }
             },
@@ -459,63 +537,6 @@ app.post('/api/profile/update', async (req, res) => {
         res.status(500).json({ message: "Failed to update profile." });
     }
 });
-// Add this temporary endpoint after your existing routes
-app.post('/api/admin/reset-events', async (req, res) => {
-    try {
-        // Clear existing events
-        await eventsCollection.deleteMany({});
-        
-        // Add fresh events
-        const defaultEvents = [
-            {
-                id: 1,
-                name: "Cricket Intercollege Championship",
-                date: "2025-10-12",
-                location: "Main Cricket Ground",
-                time: "09:00 AM",
-                category: "Cricket",
-                emoji: "🏏",
-                difficulty: "Advanced",
-                team: {
-                    name: "Warriors",
-                    maxSlots: 11,
-                    members: ["Aditya Kumar"],
-                    requirements: {
-                        minRegNumber: "2020",
-                        minExperience: 2
-                    }
-                },
-                createdAt: new Date()
-            },
-            {
-                id: 2,
-                name: "Annual Badminton Tournament",
-                date: "2025-11-08",
-                location: "Indoor Sports Hall",
-                time: "10:00 AM",
-                category: "Badminton",
-                emoji: "🏸",
-                difficulty: "Intermediate",
-                team: {
-                    name: "Shuttlers",
-                    maxSlots: 4,
-                    members: ["Rahul Patel"],
-                    requirements: {
-                        minRegNumber: "2021",
-                        minExperience: 1
-                    }
-                },
-                createdAt: new Date()
-            }
-        ];
-        
-        await eventsCollection.insertMany(defaultEvents);
-        res.json({ message: "Events reset successfully!", count: defaultEvents.length });
-    } catch (error) {
-        res.status(500).json({ message: "Failed to reset events", error: error.message });
-    }
-});
-
 
 // Get chat messages for a team
 app.get('/api/chat/:teamName', async (req, res) => {
@@ -540,6 +561,11 @@ app.get('/api/chat/:teamName', async (req, res) => {
 app.post('/api/admin/login', async (req, res) => {
     try {
         const { email, password } = req.body;
+        
+        // Validate required fields
+        if (!email || !password) {
+            return res.status(400).json({ message: "Email and password are required." });
+        }
         
         // Find admin by email
         const admin = await adminsCollection.findOne({ email: email });
@@ -600,6 +626,8 @@ app.get('/api/admin/events', async (req, res) => {
         res.status(500).json({ message: 'Failed to fetch events' });
     }
 });
+
+// Serve admin panel
 app.get('/admin', (req, res) => {
     res.sendFile(path.join(__dirname, '../sports-hub-frontend/admin.html'));
 });
@@ -608,6 +636,11 @@ app.get('/admin', (req, res) => {
 app.post('/api/admin/events', async (req, res) => {
     try {
         const { name, date, time, location, category, difficulty, emoji, teamName, maxSlots, minRegYear, minExperience } = req.body;
+        
+        // Validate required fields
+        if (!name || !date || !time || !location || !category || !difficulty || !teamName || !maxSlots || !minRegYear || minExperience === undefined) {
+            return res.status(400).json({ message: "All fields are required." });
+        }
         
         // Get the next event ID
         const lastEvent = await eventsCollection.findOne({}, { sort: { id: -1 } });
@@ -621,7 +654,7 @@ app.post('/api/admin/events', async (req, res) => {
             location,
             category,
             difficulty,
-            emoji,
+            emoji: emoji || "🏆",
             team: {
                 name: teamName,
                 maxSlots: parseInt(maxSlots),
@@ -650,14 +683,19 @@ app.delete('/api/admin/events/:eventId', async (req, res) => {
     try {
         const { eventId } = req.params;
         
+        const eventIdInt = parseInt(eventId);
+        if (isNaN(eventIdInt)) {
+            return res.status(400).json({ message: 'Invalid event ID format.' });
+        }
+        
         // Find the event first to get team name for cleanup
-        const event = await eventsCollection.findOne({ id: parseInt(eventId) });
+        const event = await eventsCollection.findOne({ id: eventIdInt });
         if (!event) {
             return res.status(404).json({ message: 'Event not found.' });
         }
         
         // Remove event from database
-        const deleteResult = await eventsCollection.deleteOne({ id: parseInt(eventId) });
+        const deleteResult = await eventsCollection.deleteOne({ id: eventIdInt });
         
         if (deleteResult.deletedCount === 0) {
             return res.status(404).json({ message: 'Event not found.' });
@@ -687,7 +725,11 @@ app.post('/api/admin/notifications/send', async (req, res) => {
     try {
         const { title, message, icon, target, specificEmail } = req.body;
         
-        let targetUsers = [];
+        // Validate required fields
+        if (!title || !message) {
+            return res.status(400).json({ message: "Title and message are required." });
+        }
+        
         let sentCount = 0;
         
         const notification = {
@@ -789,6 +831,16 @@ async function saveChatMessage(messageData) {
     }
 }
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'OK', timestamp: new Date() });
+});
+
+// Catch all handler for frontend routes
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../sports-hub-frontend/index.html'));
+});
+
 // --- Server Setup with WebSocket ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -882,7 +934,7 @@ async function startServer() {
         
         // Start the server
         server.listen(port, () => {
-            console.log(`🚀 SportsHub Server running at http://localhost:${port}`);
+            console.log(`🚀 SportsHub Server running on port ${port}`);
             console.log(`📊 Database: Connected to MongoDB Atlas`);
             console.log(`💬 WebSocket: Real-time chat enabled`);
             console.log(`🛡️ Admin Panel: Access at /admin`);
