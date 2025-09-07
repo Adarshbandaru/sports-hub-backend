@@ -22,6 +22,7 @@ let usersCollection;
 let eventsCollection;
 let chatMessagesCollection;
 let adminsCollection;
+let categoriesCollection;
 
 // --- Database Connection ---
 async function connectToDatabase() {
@@ -39,6 +40,7 @@ async function connectToDatabase() {
         eventsCollection = db.collection('events');
         chatMessagesCollection = db.collection('chatMessages');
         adminsCollection = db.collection('admins');
+        categoriesCollection = db.collection('categories');
         
         // Create indexes for better performance
         await createIndexes();
@@ -751,6 +753,48 @@ app.get('/api/admin/events', async (req, res) => {
     } catch (error) {
         console.error('Error fetching events:', error);
         res.status(500).json({ message: 'Failed to fetch events' });
+    }
+});
+app.get('/api/admin/categories', async (req, res) => {
+    try {
+        const categories = await categoriesCollection.find({}).sort({ name: 1 }).toArray();
+        res.json(categories);
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to fetch categories.' });
+    }
+});
+
+app.post('/api/admin/categories', async (req, res) => {
+    try {
+        const { name } = req.body;
+        if (!name) {
+            return res.status(400).json({ message: 'Category name is required.' });
+        }
+        const existingCategory = await categoriesCollection.findOne({ name: name });
+        if (existingCategory) {
+            return res.status(400).json({ message: 'This category already exists.' });
+        }
+        const newCategory = { name: name, createdAt: new Date() };
+        await categoriesCollection.insertOne(newCategory);
+        res.status(201).json({ message: 'Category added successfully!', category: newCategory });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to add category.' });
+    }
+});
+
+app.delete('/api/admin/categories/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid category ID format.' });
+        }
+        const result = await categoriesCollection.deleteOne({ _id: new ObjectId(id) });
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: 'Category not found.' });
+        }
+        res.status(200).json({ message: 'Category deleted successfully.' });
+    } catch (error) {
+        res.status(500).json({ message: 'Failed to delete category.' });
     }
 });
 
