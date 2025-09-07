@@ -190,8 +190,7 @@ async function initializeDefaultEvents() {
 app.use(cors({
     origin: [
         'http://localhost:3000',
-        'https://sportsmanagementsystem.netlify.app',
-        'https://sportsmanagementsystem.netlify.app/'
+        'https://sportsmanagementsystem.netlify.app'
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
@@ -201,7 +200,48 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
 
-// --- Regular API Endpoints (User-facing) ---
+// --- API Routes ---
+
+// Root endpoint - API status
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'SportsHub Backend API', 
+        status: 'Running',
+        version: '1.0.0',
+        timestamp: new Date(),
+        endpoints: {
+            events: '/api/events',
+            auth: {
+                register: 'POST /api/register',
+                login: 'POST /api/login'
+            },
+            admin: '/admin',
+            health: '/health'
+        }
+    });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'OK', timestamp: new Date() });
+});
+
+// API documentation endpoint
+app.get('/api', (req, res) => {
+    res.json({
+        message: 'SportsHub API Documentation',
+        version: '1.0.0',
+        endpoints: {
+            'GET /api/events': 'Get all events',
+            'POST /api/register': 'Register new user',
+            'POST /api/login': 'User login',
+            'POST /api/events/:id/join': 'Join event team',
+            'POST /api/teams/leave': 'Leave team',
+            'POST /api/profile/update': 'Update user profile',
+            'GET /api/chat/:teamName': 'Get chat messages'
+        }
+    });
+});
 
 // Get all events
 app.get('/api/events', async (req, res) => {
@@ -349,7 +389,7 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Join event team - FIXED VERSION
+// Join event team
 app.post('/api/events/:eventId/join', async (req, res) => {
     try {
         const { eventId } = req.params;
@@ -423,7 +463,7 @@ app.post('/api/events/:eventId/join', async (req, res) => {
         }
         
         // Update user's joined teams
-        const userUpdateResult = await usersCollection.updateOne(
+        await usersCollection.updateOne(
             { fullName: userFullName },
             { 
                 $push: { 
@@ -552,37 +592,46 @@ app.get('/api/chat/:teamName', async (req, res) => {
     }
 });
 
-// --- ADMIN API ENDPOINTS ---
+// --- ADMIN ROUTES ---
+
+// Serve admin panel
+app.get('/admin', (req, res) => {
+    res.send(`
+        <html>
+            <head><title>SportsHub Admin</title></head>
+            <body>
+                <h1>SportsHub Admin Panel</h1>
+                <p>Admin functionality available via API endpoints.</p>
+                <p>Default Admin: admin@college.edu / admin123</p>
+            </body>
+        </html>
+    `);
+});
 
 // Admin login
 app.post('/api/admin/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         
-        // Validate required fields
         if (!email || !password) {
             return res.status(400).json({ message: "Email and password are required." });
         }
         
-        // Find admin by email
         const admin = await adminsCollection.findOne({ email: email });
         if (!admin) {
             return res.status(400).json({ message: "Invalid admin credentials." });
         }
         
-        // Verify password
         const isMatch = await bcrypt.compare(password, admin.password);
         if (!isMatch) {
             return res.status(400).json({ message: "Invalid admin credentials." });
         }
         
-        // Update last login
         await adminsCollection.updateOne(
             { _id: admin._id },
             { $set: { lastLogin: new Date() } }
         );
         
-        // Return admin data (excluding password)
         const adminToReturn = {
             id: admin._id,
             email: admin.email,
@@ -624,193 +673,7 @@ app.get('/api/admin/events', async (req, res) => {
     }
 });
 
-// Serve admin panel
-app.get('/admin', (req, res) => {
-    res.sendFile(path.join(__dirname, '../sports-hub-frontend/admin.html'));
-});
-
-// Create new event (Admin only)
-app.post('/api/admin/events', async (req, res) => {
-    try {
-        const { name, date, time, location, category, difficulty, emoji, teamName, maxSlots, minRegYear, minExperience } = req.body;
-        
-        // Validate required fields
-        if (!name || !date || !time || !location || !category || !difficulty || !teamName || !maxSlots || !minRegYear || minExperience === undefined) {
-            return res.status(400).json({ message: "All fields are required." });
-        }
-        
-        // Get the next event ID
-        const lastEvent = await eventsCollection.findOne({}, { sort: { id: -1 } });
-        const nextId = lastEvent ? lastEvent.id + 1 : 1;
-        
-        const newEvent = {
-            id: nextId,
-            name,
-            date,
-            time,
-            location,
-            category,
-            difficulty,
-            emoji: emoji || "🏆",
-            team: {
-                name: teamName,
-                maxSlots: parseInt(maxSlots),
-                members: [],
-                requirements: {
-                    minRegNumber: minRegYear,
-                    minExperience: parseInt(minExperience)
-                }
-            },
-            createdAt: new Date(),
-            updatedAt: new Date()
-        };
-        
-        const result = await eventsCollection.insertOne(newEvent);
-        console.log('New event created:', result.insertedId);
-        
-        res.status(201).json({ message: "Event created successfully!", eventId: nextId });
-    } catch (error) {
-        console.error('Create event error:', error);
-        res.status(500).json({ message: "Failed to create event." });
-    }
-});
-
-// Delete event (Admin only)
-app.delete('/api/admin/events/:eventId', async (req, res) => {
-    try {
-        const { eventId } = req.params;
-        
-        const eventIdInt = parseInt(eventId);
-        if (isNaN(eventIdInt)) {
-            return res.status(400).json({ message: 'Invalid event ID format.' });
-        }
-        
-        // Find the event first to get team name for cleanup
-        const event = await eventsCollection.findOne({ id: eventIdInt });
-        if (!event) {
-            return res.status(404).json({ message: 'Event not found.' });
-        }
-        
-        // Remove event from database
-        const deleteResult = await eventsCollection.deleteOne({ id: eventIdInt });
-        
-        if (deleteResult.deletedCount === 0) {
-            return res.status(404).json({ message: 'Event not found.' });
-        }
-        
-        // Clean up user's joined teams
-        if (event.team) {
-            await usersCollection.updateMany(
-                { "joinedTeams.teamName": event.team.name },
-                { 
-                    $pull: { joinedTeams: { teamName: event.team.name } },
-                    $set: { updatedAt: new Date() }
-                }
-            );
-        }
-        
-        console.log('Event deleted:', eventId);
-        res.json({ message: 'Event deleted successfully!' });
-    } catch (error) {
-        console.error('Delete event error:', error);
-        res.status(500).json({ message: 'Failed to delete event.' });
-    }
-});
-
-// Send notifications (Admin only)
-app.post('/api/admin/notifications/send', async (req, res) => {
-    try {
-        const { title, message, icon, target, specificEmail } = req.body;
-        
-        // Validate required fields
-        if (!title || !message) {
-            return res.status(400).json({ message: "Title and message are required." });
-        }
-        
-        let sentCount = 0;
-        
-        const notification = {
-            icon: icon || "📢",
-            title,
-            body: message,
-            timestamp: new Date()
-        };
-        
-        switch (target) {
-            case 'all':
-                // Send to all users
-                const updateResult = await usersCollection.updateMany(
-                    {},
-                    {
-                        $push: {
-                            notifications: {
-                                $each: [notification],
-                                $slice: -10
-                            }
-                        },
-                        $set: { updatedAt: new Date() }
-                    }
-                );
-                sentCount = updateResult.matchedCount;
-                break;
-                
-            case 'team-members':
-                // Send to users who have joined teams
-                const teamUpdateResult = await usersCollection.updateMany(
-                    { "joinedTeams.0": { $exists: true } },
-                    {
-                        $push: {
-                            notifications: {
-                                $each: [notification],
-                                $slice: -10
-                            }
-                        },
-                        $set: { updatedAt: new Date() }
-                    }
-                );
-                sentCount = teamUpdateResult.matchedCount;
-                break;
-                
-            case 'specific':
-                // Send to specific user
-                if (!specificEmail) {
-                    return res.status(400).json({ message: 'Specific email is required.' });
-                }
-                
-                const specificUpdateResult = await usersCollection.updateOne(
-                    { email: specificEmail },
-                    {
-                        $push: {
-                            notifications: {
-                                $each: [notification],
-                                $slice: -10
-                            }
-                        },
-                        $set: { updatedAt: new Date() }
-                    }
-                );
-                
-                if (specificUpdateResult.matchedCount === 0) {
-                    return res.status(404).json({ message: 'User not found with this email.' });
-                }
-                
-                sentCount = specificUpdateResult.matchedCount;
-                break;
-                
-            default:
-                return res.status(400).json({ message: 'Invalid target specified.' });
-        }
-        
-        console.log(`Notification sent to ${sentCount} users`);
-        res.json({ message: 'Notification sent successfully!', sentCount });
-        
-    } catch (error) {
-        console.error('Send notification error:', error);
-        res.status(500).json({ message: 'Failed to send notification.' });
-    }
-});
-
-// Save chat message
+// Save chat message function
 async function saveChatMessage(messageData) {
     try {
         const message = {
@@ -828,72 +691,10 @@ async function saveChatMessage(messageData) {
     }
 }
 
-// Root endpoint - API status
-app.get('/', (req, res) => {
-    res.json({ 
-        message: 'SportsHub Backend API', 
-        status: 'Running',
-        version: '1.0.0',
-        timestamp: new Date(),
-        endpoints: {
-            events: '/api/events',
-            auth: {
-                register: 'POST /api/register',
-                login: 'POST /api/login'
-            },
-            admin: '/admin',
-            health: '/health'
-        }
-    });
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date() });
-});
-
-// Serve admin panel
-app.get('/admin', (req, res) => {
-    res.sendFile(path.join(__dirname, '../sports-hub-frontend/admin.html'));
-});
-
-// API documentation endpoint
-app.get('/api', (req, res) => {
-    res.json({
-        message: 'SportsHub API Documentation',
-        version: '1.0.0',
-        endpoints: {
-            'GET /api/events': 'Get all events',
-            'POST /api/register': 'Register new user',
-            'POST /api/login': 'User login',
-            'POST /api/events/:id/join': 'Join event team',
-            'POST /api/teams/leave': 'Leave team',
-            'POST /api/profile/update': 'Update user profile',
-            'GET /api/chat/:teamName': 'Get chat messages',
-            'POST /api/admin/login': 'Admin login',
-            'GET /api/admin/users': 'Get all users (admin)',
-            'GET /api/admin/events': 'Get all events (admin)',
-            'POST /api/admin/events': 'Create event (admin)',
-            'DELETE /api/admin/events/:id': 'Delete event (admin)',
-            'POST /api/admin/notifications/send': 'Send notifications (admin)'
-        }
-    });
-});
-
-// Catch all handler - should be last
-app.get('*', (req, res) => {
-    res.status(404).json({ 
-        error: 'Endpoint not found', 
-        message: 'Visit / for API info or /health for status check',
-        availableRoutes: ['/', '/api', '/health', '/admin']
-    });
-});
-
-// --- Server Setup with WebSocket ---
+// --- WebSocket Setup ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// WebSocket connection handler
 wss.on('connection', (ws) => {
     console.log('New WebSocket client connected');
     ws.teamName = null;
@@ -905,31 +706,9 @@ wss.on('connection', (ws) => {
             if (data.type === 'join') {
                 ws.teamName = data.teamName;
                 console.log(`Client joined team chat: ${ws.teamName}`);
-                
-                // Send recent chat history to the newly joined client
-                try {
-                    const recentMessages = await chatMessagesCollection
-                        .find({ teamName: ws.teamName })
-                        .sort({ timestamp: -1 })
-                        .limit(50)
-                        .toArray();
-                    
-                    // Send messages in chronological order
-                    recentMessages.reverse().forEach(msg => {
-                        ws.send(JSON.stringify({
-                            type: 'message',
-                            sender: msg.sender,
-                            text: msg.text,
-                            timestamp: msg.timestamp
-                        }));
-                    });
-                } catch (error) {
-                    console.error('Error loading chat history:', error);
-                }
             }
             
             if (data.type === 'message') {
-                // Save message to database
                 const savedMessage = await saveChatMessage({
                     teamName: ws.teamName,
                     sender: data.sender,
@@ -937,7 +716,6 @@ wss.on('connection', (ws) => {
                 });
                 
                 if (savedMessage) {
-                    // Broadcast message to all clients in the same team
                     wss.clients.forEach((client) => {
                         if (client.readyState === ws.OPEN && client.teamName === ws.teamName) {
                             client.send(JSON.stringify({
@@ -958,10 +736,6 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         console.log('WebSocket client disconnected');
     });
-    
-    ws.on('error', (error) => {
-        console.error('WebSocket error:', error);
-    });
 });
 
 // --- Error Handling ---
@@ -969,24 +743,15 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
-    process.exit(1);
-});
-
 // --- Start Server ---
 async function startServer() {
     try {
-        // Connect to database first
         await connectToDatabase();
         
-        // Start the server
         server.listen(port, () => {
             console.log(`🚀 SportsHub Server running on port ${port}`);
             console.log(`📊 Database: Connected to MongoDB Atlas`);
             console.log(`💬 WebSocket: Real-time chat enabled`);
-            console.log(`🛡️ Admin Panel: Access at /admin`);
-            console.log(`🔑 Default Admin: admin@college.edu / admin123`);
             console.log(`🏆 Ready for sports management!`);
         });
     } catch (error) {
@@ -995,5 +760,4 @@ async function startServer() {
     }
 }
 
-// Start the application
 startServer();
