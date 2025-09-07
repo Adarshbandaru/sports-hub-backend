@@ -410,6 +410,51 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: "Server error during login." });
     }
 });
+// Add this new endpoint to your server.js
+
+app.post('/api/admin/notifications/send', async (req, res) => {
+    try {
+        const { title, message, icon, target, specificEmail } = req.body;
+
+        if (!title || !message || !icon || !target) {
+            return res.status(400).json({ message: 'Missing required notification fields.' });
+        }
+
+        const newNotification = {
+            icon,
+            title,
+            body: message,
+            timestamp: new Date()
+        };
+
+        let targetQuery = {};
+        if (target === 'all') {
+            targetQuery = {}; // Empty query targets all documents
+        } else if (target === 'specific') {
+            if (!specificEmail) {
+                return res.status(400).json({ message: 'Specific user email is required.' });
+            }
+            targetQuery = { email: specificEmail };
+        }
+        // Note: 'team-members' target would require more complex logic
+
+        const result = await usersCollection.updateMany(targetQuery, {
+            $push: {
+                notifications: {
+                    $each: [newNotification],
+                    $slice: -10 // Keep only the last 10 notifications
+                }
+            }
+        });
+
+        console.log(`Notification sent to ${result.modifiedCount} users.`);
+        res.status(200).json({ message: 'Notification sent successfully!', sentCount: result.modifiedCount });
+
+    } catch (error) {
+        console.error('Error sending notification:', error);
+        res.status(500).json({ message: 'Failed to send notification.' });
+    }
+});
 
 // Join event team
 app.post('/api/events/:eventId/join', async (req, res) => {
