@@ -264,6 +264,17 @@ app.get('/api/events', async (req, res) => {
         res.status(500).json({ message: 'Failed to fetch events' });
     }
 });
+// Add this new endpoint to your server.js
+app.get('/api/seed-events', async (req, res) => {
+    try {
+        await eventsCollection.deleteMany({}); // Clear any old/bad data first
+        await initializeDefaultEvents(); // Run the function that adds the default events
+        res.status(200).send('Events have been successfully added to the database!');
+    } catch (error) {
+        console.error('Seeding error:', error);
+        res.status(500).json({ message: 'Failed to seed events.' });
+    }
+});
 
 // Register new user
 app.post('/api/register', async (req, res) => {
