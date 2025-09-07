@@ -187,7 +187,7 @@ async function initializeDefaultEvents() {
 }
 
 // --- Middleware ---
-app.use(cors());
+app.use(cors({     origin: [         'http://localhost:3000',         'https://sportsmanagementsystem.netlify.app'     ],     credentials: true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
 
