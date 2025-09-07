@@ -831,14 +831,65 @@ async function saveChatMessage(messageData) {
     }
 }
 
+// Root endpoint - API status
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'SportsHub Backend API', 
+        status: 'Running',
+        version: '1.0.0',
+        timestamp: new Date(),
+        endpoints: {
+            events: '/api/events',
+            auth: {
+                register: 'POST /api/register',
+                login: 'POST /api/login'
+            },
+            admin: '/admin',
+            health: '/health'
+        }
+    });
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date() });
 });
 
-// Catch all handler for frontend routes
+// Serve admin panel
+app.get('/admin', (req, res) => {
+    res.sendFile(path.join(__dirname, '../sports-hub-frontend/admin.html'));
+});
+
+// API documentation endpoint
+app.get('/api', (req, res) => {
+    res.json({
+        message: 'SportsHub API Documentation',
+        version: '1.0.0',
+        endpoints: {
+            'GET /api/events': 'Get all events',
+            'POST /api/register': 'Register new user',
+            'POST /api/login': 'User login',
+            'POST /api/events/:id/join': 'Join event team',
+            'POST /api/teams/leave': 'Leave team',
+            'POST /api/profile/update': 'Update user profile',
+            'GET /api/chat/:teamName': 'Get chat messages',
+            'POST /api/admin/login': 'Admin login',
+            'GET /api/admin/users': 'Get all users (admin)',
+            'GET /api/admin/events': 'Get all events (admin)',
+            'POST /api/admin/events': 'Create event (admin)',
+            'DELETE /api/admin/events/:id': 'Delete event (admin)',
+            'POST /api/admin/notifications/send': 'Send notifications (admin)'
+        }
+    });
+});
+
+// Catch all handler - should be last
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../sports-hub-frontend/index.html'));
+    res.status(404).json({ 
+        error: 'Endpoint not found', 
+        message: 'Visit / for API info or /health for status check',
+        availableRoutes: ['/', '/api', '/health', '/admin']
+    });
 });
 
 // --- Server Setup with WebSocket ---
