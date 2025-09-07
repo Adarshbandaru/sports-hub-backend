@@ -191,15 +191,12 @@ app.use(cors({
     origin: [
         'http://localhost:3000',
         'https://sportsmanagementsystem.netlify.app',
-        'https://*.netlify.app'
+        'https://sportsmanagementsystem.netlify.app/'
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Accept', 'Authorization'],
     credentials: true
 }));
-
-// Handle preflight requests
-app.options('*', cors());
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
