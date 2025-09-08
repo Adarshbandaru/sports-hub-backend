@@ -1,4 +1,4 @@
-// server.js - SportsHub Backend with MongoDB Atlas & Admin Panel
+// server.js - SportsHub Backend with MongoDB Atlas & Admin Panel & Real-Time Notifications
 
 // --- Imports ---
 const express = require('express');
@@ -23,6 +23,9 @@ let eventsCollection;
 let chatMessagesCollection;
 let adminsCollection;
 let categoriesCollection;
+
+// --- WebSocket Client Management ---
+const notificationClients = new Map(); // Map of userEmail -> WebSocket connection
 
 // --- Database Connection ---
 async function connectToDatabase() {
@@ -202,18 +205,23 @@ app.use(cors({
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../sports-hub-frontend')));
 
+// --- NOTIFICATION FUNCTIONS ---
+function sendRealTimeNotification(userEmail, notification) {
+    const client = notificationClients.get(userEmail);
+    if (client && client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify({
+            type: 'notification',
+            notification: notification
+        }));
+        console.log(`Real-time notification sent to: ${userEmail}`);
+        return true;
+    }
+    return false;
+}
+
 // --- API Routes ---
 
 // Root endpoint - API status
-// Add this new endpoint to your server.js to create the default admin
-app.get('/api/seed-admin', async (req, res) => {
-    try {
-        await initializeDefaultAdmin(); // This re-uses the function you already wrote
-        res.status(200).send('Default admin creation process completed. You can now log in.');
-    } catch (error) {
-        res.status(500).send('Failed to seed admin.');
-    }
-});
 app.get('/', (req, res) => {
     res.json({ 
         message: 'SportsHub Backend API', 
@@ -249,9 +257,32 @@ app.get('/api', (req, res) => {
             'POST /api/events/:id/join': 'Join event team',
             'POST /api/teams/leave': 'Leave team',
             'POST /api/profile/update': 'Update user profile',
-            'GET /api/chat/:teamName': 'Get chat messages'
+            'GET /api/chat/:teamName': 'Get chat messages',
+            'POST /api/notifications/mark-read': 'Mark notifications as read'
         }
     });
+});
+
+// Seed admin endpoint
+app.get('/api/seed-admin', async (req, res) => {
+    try {
+        await initializeDefaultAdmin();
+        res.status(200).send('Default admin creation process completed. You can now log in.');
+    } catch (error) {
+        res.status(500).send('Failed to seed admin.');
+    }
+});
+
+// Seed events endpoint
+app.get('/api/seed-events', async (req, res) => {
+    try {
+        await eventsCollection.deleteMany({});
+        await initializeDefaultEvents();
+        res.status(200).send('Events have been successfully added to the database!');
+    } catch (error) {
+        console.error('Seeding error:', error);
+        res.status(500).json({ message: 'Failed to seed events.' });
+    }
 });
 
 // Get all events
@@ -273,17 +304,6 @@ app.get('/api/events', async (req, res) => {
     } catch (error) {
         console.error('Error fetching events:', error);
         res.status(500).json({ message: 'Failed to fetch events' });
-    }
-});
-// Add this new endpoint to your server.js
-app.get('/api/seed-events', async (req, res) => {
-    try {
-        await eventsCollection.deleteMany({}); // Clear any old/bad data first
-        await initializeDefaultEvents(); // Run the function that adds the default events
-        res.status(200).send('Events have been successfully added to the database!');
-    } catch (error) {
-        console.error('Seeding error:', error);
-        res.status(500).json({ message: 'Failed to seed events.' });
     }
 });
 
@@ -327,7 +347,8 @@ app.post('/api/register', async (req, res) => {
                 icon: "🏆",
                 title: `Welcome ${fullName}!`,
                 body: "Your account has been created successfully. Explore events and join the fun.",
-                timestamp: new Date()
+                timestamp: new Date(),
+                read: false
             }],
             createdAt: new Date(),
             updatedAt: new Date()
@@ -384,7 +405,8 @@ app.post('/api/login', async (req, res) => {
                             icon: "🏆",
                             title: `Welcome back, ${user.fullName}!`,
                             body: "Ready to join some exciting tournaments?",
-                            timestamp: new Date()
+                            timestamp: new Date(),
+                            read: false
                         }],
                         $slice: -10 // Keep only last 10 notifications
                     }
@@ -410,49 +432,35 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: "Server error during login." });
     }
 });
-// Add this new endpoint to your server.js
 
-app.post('/api/admin/notifications/send', async (req, res) => {
+// Mark notifications as read
+app.post('/api/notifications/mark-read', async (req, res) => {
     try {
-        const { title, message, icon, target, specificEmail } = req.body;
-
-        if (!title || !message || !icon || !target) {
-            return res.status(400).json({ message: 'Missing required notification fields.' });
+        const { userEmail } = req.body;
+        
+        if (!userEmail) {
+            return res.status(400).json({ message: 'User email is required.' });
         }
-
-        const newNotification = {
-            icon,
-            title,
-            body: message,
-            timestamp: new Date()
-        };
-
-        let targetQuery = {};
-        if (target === 'all') {
-            targetQuery = {}; // Empty query targets all documents
-        } else if (target === 'specific') {
-            if (!specificEmail) {
-                return res.status(400).json({ message: 'Specific user email is required.' });
-            }
-            targetQuery = { email: specificEmail };
-        }
-        // Note: 'team-members' target would require more complex logic
-
-        const result = await usersCollection.updateMany(targetQuery, {
-            $push: {
-                notifications: {
-                    $each: [newNotification],
-                    $slice: -10 // Keep only the last 10 notifications
+        
+        // Find the user and mark notifications as read
+        const result = await usersCollection.updateOne(
+            { email: userEmail },
+            { 
+                $set: { 
+                    'notifications.$[].read': true,
+                    updatedAt: new Date()
                 }
             }
-        });
-
-        console.log(`Notification sent to ${result.modifiedCount} users.`);
-        res.status(200).json({ message: 'Notification sent successfully!', sentCount: result.modifiedCount });
-
+        );
+        
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+        
+        res.status(200).json({ message: 'Notifications marked as read.' });
     } catch (error) {
-        console.error('Error sending notification:', error);
-        res.status(500).json({ message: 'Failed to send notification.' });
+        console.error('Error marking notifications as read:', error);
+        res.status(500).json({ message: 'Failed to mark notifications as read.' });
     }
 });
 
@@ -713,7 +721,8 @@ app.post('/api/admin/login', async (req, res) => {
         res.status(500).json({ message: "Server error during admin login." });
     }
 });
-// NEW: Admin endpoint to create a new event
+
+// Admin endpoint to create a new event
 app.post('/api/admin/events', async (req, res) => {
     try {
         const eventData = req.body;
@@ -723,7 +732,7 @@ app.post('/api/admin/events', async (req, res) => {
         }
 
         const newEvent = {
-            id: await eventsCollection.countDocuments() + 1, // Simple auto-incrementing ID
+            id: await eventsCollection.countDocuments() + 1,
             name: eventData.name,
             date: eventData.date,
             location: eventData.location,
@@ -752,7 +761,8 @@ app.post('/api/admin/events', async (req, res) => {
         res.status(500).json({ message: 'Failed to create event.' });
     }
 });
-// NEW: Admin endpoint to delete an event
+
+// Admin endpoint to delete an event
 app.delete('/api/admin/events/:eventId', async (req, res) => {
     try {
         const eventId = parseInt(req.params.eventId);
@@ -772,6 +782,70 @@ app.delete('/api/admin/events/:eventId', async (req, res) => {
     } catch (error) {
         console.error('Error deleting event:', error);
         res.status(500).json({ message: 'Failed to delete event.' });
+    }
+});
+
+// Admin send notifications
+app.post('/api/admin/notifications/send', async (req, res) => {
+    try {
+        const { title, message, icon, target, specificEmail } = req.body;
+
+        if (!title || !message || !icon || !target) {
+            return res.status(400).json({ message: 'Missing required notification fields.' });
+        }
+
+        const newNotification = {
+            icon,
+            title,
+            body: message,
+            timestamp: new Date(),
+            read: false
+        };
+
+        let targetQuery = {};
+        let targetUsers = [];
+        
+        if (target === 'all') {
+            targetQuery = {};
+            // Get all user emails for real-time delivery
+            const users = await usersCollection.find({}, { projection: { email: 1 } }).toArray();
+            targetUsers = users.map(user => user.email);
+        } else if (target === 'specific') {
+            if (!specificEmail) {
+                return res.status(400).json({ message: 'Specific user email is required.' });
+            }
+            targetQuery = { email: specificEmail };
+            targetUsers = [specificEmail];
+        }
+
+        // Update database
+        const result = await usersCollection.updateMany(targetQuery, {
+            $push: {
+                notifications: {
+                    $each: [newNotification],
+                    $slice: -10 // Keep only the last 10 notifications
+                }
+            }
+        });
+
+        // Send real-time notifications
+        let realTimeDelivered = 0;
+        targetUsers.forEach(email => {
+            if (sendRealTimeNotification(email, newNotification)) {
+                realTimeDelivered++;
+            }
+        });
+
+        console.log(`Notification sent to ${result.modifiedCount} users (${realTimeDelivered} real-time)`);
+        res.status(200).json({ 
+            message: 'Notification sent successfully!', 
+            sentCount: result.modifiedCount,
+            realTimeDelivered: realTimeDelivered
+        });
+
+    } catch (error) {
+        console.error('Error sending notification:', error);
+        res.status(500).json({ message: 'Failed to send notification.' });
     }
 });
 
@@ -800,6 +874,8 @@ app.get('/api/admin/events', async (req, res) => {
         res.status(500).json({ message: 'Failed to fetch events' });
     }
 });
+
+// Get categories
 app.get('/api/admin/categories', async (req, res) => {
     try {
         const categories = await categoriesCollection.find({}).sort({ name: 1 }).toArray();
@@ -809,6 +885,7 @@ app.get('/api/admin/categories', async (req, res) => {
     }
 });
 
+// Add category
 app.post('/api/admin/categories', async (req, res) => {
     try {
         const { name } = req.body;
@@ -827,6 +904,7 @@ app.post('/api/admin/categories', async (req, res) => {
     }
 });
 
+// Delete category
 app.delete('/api/admin/categories/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -865,8 +943,48 @@ async function saveChatMessage(messageData) {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws) => {
-    console.log('New WebSocket client connected');
+wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    
+    if (url.pathname === '/notifications') {
+        handleNotificationConnection(ws);
+    } else {
+        handleChatConnection(ws);
+    }
+});
+
+// Handle notification WebSocket connections
+function handleNotificationConnection(ws) {
+    console.log('New notification WebSocket client connected');
+    
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            
+            if (data.type === 'register' && data.userEmail) {
+                notificationClients.set(data.userEmail, ws);
+                console.log(`Notification client registered for: ${data.userEmail}`);
+            }
+        } catch (error) {
+            console.error('Notification WebSocket message error:', error);
+        }
+    });
+    
+    ws.on('close', () => {
+        // Remove this connection from all registered users
+        for (const [email, connection] of notificationClients.entries()) {
+            if (connection === ws) {
+                notificationClients.delete(email);
+                console.log(`Notification client disconnected: ${email}`);
+                break;
+            }
+        }
+    });
+}
+
+// Handle chat WebSocket connections
+function handleChatConnection(ws) {
+    console.log('New chat WebSocket client connected');
     ws.teamName = null;
     
     ws.on('message', async (message) => {
@@ -887,7 +1005,7 @@ wss.on('connection', (ws) => {
                 
                 if (savedMessage) {
                     wss.clients.forEach((client) => {
-                        if (client.readyState === ws.OPEN && client.teamName === ws.teamName) {
+                        if (client.readyState === WebSocket.OPEN && client.teamName === ws.teamName) {
                             client.send(JSON.stringify({
                                 type: 'message',
                                 sender: savedMessage.sender,
@@ -899,14 +1017,14 @@ wss.on('connection', (ws) => {
                 }
             }
         } catch (error) {
-            console.error('WebSocket message error:', error);
+            console.error('Chat WebSocket message error:', error);
         }
     });
     
     ws.on('close', () => {
-        console.log('WebSocket client disconnected');
+        console.log('Chat WebSocket client disconnected');
     });
-});
+}
 
 // --- Error Handling ---
 process.on('unhandledRejection', (reason, promise) => {
@@ -922,6 +1040,7 @@ async function startServer() {
             console.log(`🚀 SportsHub Server running on port ${port}`);
             console.log(`📊 Database: Connected to MongoDB Atlas`);
             console.log(`💬 WebSocket: Real-time chat enabled`);
+            console.log(`🔔 Notifications: Real-time delivery enabled`);
             console.log(`🏆 Ready for sports management!`);
         });
     } catch (error) {
