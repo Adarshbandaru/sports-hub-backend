@@ -476,6 +476,8 @@ app.post('/api/profile/avatar-upload', upload.single('avatar'), async (req, res)
 });
 
 // Mark notifications as read
+// In server.js, replace the existing /api/notifications/mark-read endpoint
+
 app.post('/api/notifications/mark-read', async (req, res) => {
     try {
         const { userEmail } = req.body;
@@ -484,21 +486,18 @@ app.post('/api/notifications/mark-read', async (req, res) => {
             return res.status(400).json({ message: 'User email is required.' });
         }
         
-        // Find the user and mark notifications as read
-        const result = await usersCollection.updateOne(
+        // This query finds the user and sets the 'read' field to true 
+        // for all sub-documents in the 'notifications' array.
+        const result = await usersCollection.updateMany(
             { email: userEmail },
-            { 
-                $set: { 
-                    'notifications.$[].read': true,
-                    updatedAt: new Date()
-                }
-            }
+            { $set: { "notifications.$[].read": true } }
         );
         
         if (result.matchedCount === 0) {
             return res.status(404).json({ message: 'User not found.' });
         }
         
+        console.log(`Marked notifications as read for ${userEmail}`);
         res.status(200).json({ message: 'Notifications marked as read.' });
     } catch (error) {
         console.error('Error marking notifications as read:', error);
