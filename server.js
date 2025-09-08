@@ -1,6 +1,16 @@
 // server.js - SportsHub Backend with MongoDB Atlas & Admin Panel & Real-Time Notifications
+// Add this at the top of server.js
+require('dotenv').config();
+const cloudinary = require('cloudinary').v2;
 
+cloudinary.config({ 
+  cloud_name: process.env.CLOUD_NAME, 
+  api_key: process.env.API_KEY, 
+  api_secret: process.env.API_SECRET 
+});
 // --- Imports ---
+const multer = require('multer');
+const upload = multer({ dest: 'uploads/' }); // Configures a temporary folder for uploads
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
@@ -430,6 +440,38 @@ app.post('/api/login', async (req, res) => {
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ message: "Server error during login." });
+    }
+});
+// Add this new endpoint to server.js
+app.post('/api/profile/avatar-upload', upload.single('avatar'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ message: 'No file uploaded.' });
+        }
+
+        // Upload the file to Cloudinary
+        const result = await cloudinary.uploader.upload(req.file.path, {
+            folder: "sports-hub-avatars" // Optional: organize uploads in Cloudinary
+        });
+
+        // The user's email will be sent along with the file to identify them
+        const { userEmail } = req.body;
+        
+        // Update the user's document in MongoDB with the new avatar URL
+        await usersCollection.updateOne(
+            { email: userEmail },
+            { $set: { avatarUrl: result.secure_url } }
+        );
+
+        console.log(`Avatar updated for ${userEmail}`);
+        res.status(200).json({ 
+            message: "Avatar updated successfully!", 
+            avatarUrl: result.secure_url
+        });
+
+    } catch (error) {
+        console.error('Avatar upload error:', error);
+        res.status(500).json({ message: 'Failed to upload avatar.' });
     }
 });
 
