@@ -1,4 +1,6 @@
 // server.js - SportsHub Backend with MongoDB Atlas & Admin Panel & Real-Time Notifications
+const jwt = require('jsonwebtoken');
+require('dotenv').config();
 // Add this at the top of server.js
 require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
@@ -11,6 +13,8 @@ cloudinary.config({
 // --- Imports ---
 const multer = require('multer');
 const upload = multer({ dest: 'uploads/' }); // Configures a temporary folder for uploads
+const JWT_SECRET = process.env.JWT_SECRET || 'sportsHub-fallback-secret-key-change-in-production';
+const JWT_EXPIRES_IN = '24h';
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
@@ -200,6 +204,49 @@ async function initializeDefaultEvents() {
         console.error('Error initializing default events:', error);
     }
 }
+// --- JWT HELPER FUNCTIONS ---
+function generateToken(user) {
+    const payload = {
+        id: user._id.toString(),
+        email: user.email,
+        fullName: user.fullName,
+        role: user.role || 'user'
+    };
+    
+    const token = jwt.sign(payload, JWT_SECRET, {
+        expiresIn: JWT_EXPIRES_IN
+    });
+    
+    console.log('Token generated for user:', user.email);
+    return token;
+}
+
+function verifyToken(token) {
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        return { success: true, data: decoded };
+    } catch (error) {
+        console.log('Token verification failed:', error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) {
+        return res.status(401).json({ message: 'Access token required' });
+    }
+    
+    const result = verifyToken(token);
+    if (!result.success) {
+        return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    
+    req.user = result.data;
+    next();
+}
 
 // --- Middleware ---
 app.use(cors({
@@ -387,24 +434,23 @@ app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         
-        // Validate required fields
         if (!email || !password) {
             return res.status(400).json({ message: "Email and password are required." });
         }
         
-        // Find user by email
         const user = await usersCollection.findOne({ email: email });
         if (!user) {
             return res.status(400).json({ message: "Invalid credentials." });
         }
         
-        // Verify password
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
             return res.status(400).json({ message: "Invalid credentials." });
         }
         
-        // Update last login and add welcome notification
+        // Generate JWT token - THIS IS NEW
+        const token = generateToken(user);
+        
         await usersCollection.updateOne(
             { _id: user._id },
             { 
@@ -418,13 +464,12 @@ app.post('/api/login', async (req, res) => {
                             timestamp: new Date(),
                             read: false
                         }],
-                        $slice: -10 // Keep only last 10 notifications
+                        $slice: -10
                     }
                 }
             }
         );
         
-        // Return user data (excluding password)
         const userToReturn = {
             id: user._id,
             fullName: user.fullName,
@@ -436,10 +481,25 @@ app.post('/api/login', async (req, res) => {
             notifications: user.notifications || []
         };
         
-        res.status(200).json({ message: "Login successful!", user: userToReturn });
+        // Return both user data and token - THIS IS NEW
+        res.status(200).json({ 
+            message: "Login successful!", 
+            user: userToReturn,
+            token: token
+        });
+        
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ message: "Server error during login." });
+    }
+});
+app.post('/api/logout', authenticateToken, async (req, res) => {
+    try {
+        console.log(`User ${req.user.fullName} logged out`);
+        res.status(200).json({ message: 'Logged out successfully' });
+    } catch (error) {
+        console.error('Logout error:', error);
+        res.status(500).json({ message: 'Failed to logout' });
     }
 });
 // Add this new endpoint to server.js
@@ -506,30 +566,27 @@ app.post('/api/notifications/mark-read', async (req, res) => {
 });
 
 // Join event team
-app.post('/api/events/:eventId/join', async (req, res) => {
+app.post('/api/events/:eventId/join', authenticateToken, async (req, res) => {
     try {
         const { eventId } = req.params;
-        const { userFullName, userRegNumber, userExperience } = req.body;
+        const { userRegNumber, userExperience } = req.body;
         
-        // Enhanced debugging
+        // Get user info from the token instead of request body
+        const userFullName = req.user.fullName;
+        
         console.log('Join request - Event ID:', eventId);
-        console.log('Join request - User:', userFullName);
-        console.log('Join request - RegNumber:', userRegNumber);
-        console.log('Join request - Experience:', userExperience);
+        console.log('Join request - User from token:', userFullName);
         
-        // Validate required fields
-        if (!userFullName || !userRegNumber || userExperience === undefined) {
-            return res.status(400).json({ message: 'All fields are required.' });
+        if (!userRegNumber || userExperience === undefined) {
+            return res.status(400).json({ message: 'Registration number and experience are required.' });
         }
         
-        // Convert eventId to integer and find the event
         const eventIdInt = parseInt(eventId);
         if (isNaN(eventIdInt)) {
             return res.status(400).json({ message: 'Invalid event ID format.' });
         }
         
         const event = await eventsCollection.findOne({ id: eventIdInt });
-        console.log('Found event:', event ? event.name : 'No event found');
         
         if (!event) {
             return res.status(404).json({ message: 'Event not found.' });
@@ -539,12 +596,10 @@ app.post('/api/events/:eventId/join', async (req, res) => {
             return res.status(404).json({ message: 'Team information not found for this event.' });
         }
         
-        // Check if user is already in the team
         if (event.team.members.includes(userFullName)) {
             return res.status(400).json({ message: 'You are already a member of this team.' });
         }
         
-        // Validate requirements
         const { requirements } = event.team;
         const userRegYear = parseInt(userRegNumber.substring(0, 4));
         const minRegYear = parseInt(requirements.minRegNumber);
@@ -565,7 +620,6 @@ app.post('/api/events/:eventId/join', async (req, res) => {
             return res.status(400).json({ message: 'Sorry, this team is full.' });
         }
         
-        // Add user to team
         const updateResult = await eventsCollection.updateOne(
             { id: eventIdInt },
             { 
@@ -578,7 +632,6 @@ app.post('/api/events/:eventId/join', async (req, res) => {
             return res.status(404).json({ message: 'Failed to update event.' });
         }
         
-        // Update user's joined teams
         await usersCollection.updateOne(
             { fullName: userFullName },
             { 
