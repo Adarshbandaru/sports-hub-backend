@@ -1,7 +1,5 @@
-// server.js - SportsHub Backend with MongoDB Atlas & Admin Panel & Real-Time Notifications
+// server.js - SportsHub Backend with Improved JWT Authentication
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
-// Add this at the top of server.js
 require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
 
@@ -10,11 +8,10 @@ cloudinary.config({
   api_key: process.env.API_KEY, 
   api_secret: process.env.API_SECRET 
 });
+
 // --- Imports ---
 const multer = require('multer');
-const upload = multer({ dest: 'uploads/' }); // Configures a temporary folder for uploads
-const JWT_SECRET = process.env.JWT_SECRET || 'sportsHub-fallback-secret-key-change-in-production';
-const JWT_EXPIRES_IN = '24h';
+const upload = multer({ dest: 'uploads/' });
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
@@ -22,6 +19,12 @@ const bcrypt = require('bcryptjs');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const { MongoClient, ObjectId } = require('mongodb');
+
+// --- JWT Configuration ---
+const JWT_SECRET = process.env.JWT_SECRET || 'sportsHub-fallback-secret-key-change-in-production';
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'sportsHub-refresh-secret-key-change-in-production';
+const JWT_EXPIRES_IN = '15m'; // Short-lived access token
+const JWT_REFRESH_EXPIRES_IN = '7d'; // Long-lived refresh token
 
 // --- App Setup ---
 const app = express();
@@ -37,9 +40,10 @@ let eventsCollection;
 let chatMessagesCollection;
 let adminsCollection;
 let categoriesCollection;
+let refreshTokensCollection;
 
 // --- WebSocket Client Management ---
-const notificationClients = new Map(); // Map of userEmail -> WebSocket connection
+const notificationClients = new Map();
 
 // --- Database Connection ---
 async function connectToDatabase() {
@@ -58,11 +62,9 @@ async function connectToDatabase() {
         chatMessagesCollection = db.collection('chatMessages');
         adminsCollection = db.collection('admins');
         categoriesCollection = db.collection('categories');
+        refreshTokensCollection = db.collection('refreshTokens');
         
-        // Create indexes for better performance
         await createIndexes();
-        
-        // Initialize default data
         await initializeDefaultEvents();
         await initializeDefaultAdmin();
         
@@ -81,6 +83,8 @@ async function createIndexes() {
         await chatMessagesCollection.createIndex({ teamName: 1 });
         await chatMessagesCollection.createIndex({ timestamp: 1 });
         await adminsCollection.createIndex({ email: 1 }, { unique: true });
+        await refreshTokensCollection.createIndex({ token: 1 }, { unique: true });
+        await refreshTokensCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
         console.log('Database indexes created successfully');
     } catch (error) {
         console.log('Some indexes may already exist:', error.message);
@@ -204,8 +208,9 @@ async function initializeDefaultEvents() {
         console.error('Error initializing default events:', error);
     }
 }
-// --- JWT HELPER FUNCTIONS ---
-function generateToken(user) {
+
+// --- IMPROVED JWT HELPER FUNCTIONS ---
+function generateTokens(user) {
     const payload = {
         id: user._id.toString(),
         email: user.email,
@@ -213,21 +218,72 @@ function generateToken(user) {
         role: user.role || 'user'
     };
     
-    const token = jwt.sign(payload, JWT_SECRET, {
+    const accessToken = jwt.sign(payload, JWT_SECRET, {
         expiresIn: JWT_EXPIRES_IN
     });
     
-    console.log('Token generated for user:', user.email);
-    return token;
+    const refreshToken = jwt.sign({ 
+        id: user._id.toString(),
+        tokenVersion: user.tokenVersion || 0 
+    }, JWT_REFRESH_SECRET, {
+        expiresIn: JWT_REFRESH_EXPIRES_IN
+    });
+    
+    console.log('Tokens generated for user:', user.email);
+    return { accessToken, refreshToken };
 }
 
-function verifyToken(token) {
+function verifyAccessToken(token) {
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
         return { success: true, data: decoded };
     } catch (error) {
-        console.log('Token verification failed:', error.message);
+        console.log('Access token verification failed:', error.message);
         return { success: false, error: error.message };
+    }
+}
+
+function verifyRefreshToken(token) {
+    try {
+        const decoded = jwt.verify(token, JWT_REFRESH_SECRET);
+        return { success: true, data: decoded };
+    } catch (error) {
+        console.log('Refresh token verification failed:', error.message);
+        return { success: false, error: error.message };
+    }
+}
+
+async function storeRefreshToken(userId, token) {
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days from now
+    
+    try {
+        await refreshTokensCollection.insertOne({
+            userId: userId,
+            token: token,
+            createdAt: new Date(),
+            expiresAt: expiresAt
+        });
+    } catch (error) {
+        console.error('Error storing refresh token:', error);
+    }
+}
+
+async function removeRefreshToken(token) {
+    try {
+        await refreshTokensCollection.deleteOne({ token });
+    } catch (error) {
+        console.error('Error removing refresh token:', error);
+    }
+}
+
+async function isRefreshTokenValid(token) {
+    try {
+        const storedToken = await refreshTokensCollection.findOne({ token });
+        return !!storedToken;
+    } catch (error) {
+        console.error('Error checking refresh token validity:', error);
+        return false;
     }
 }
 
@@ -239,9 +295,12 @@ function authenticateToken(req, res, next) {
         return res.status(401).json({ message: 'Access token required' });
     }
     
-    const result = verifyToken(token);
+    const result = verifyAccessToken(token);
     if (!result.success) {
-        return res.status(403).json({ message: 'Invalid or expired token' });
+        if (result.error.includes('expired')) {
+            return res.status(401).json({ message: 'Token expired', code: 'TOKEN_EXPIRED' });
+        }
+        return res.status(403).json({ message: 'Invalid token' });
     }
     
     req.user = result.data;
@@ -277,19 +336,19 @@ function sendRealTimeNotification(userEmail, notification) {
 }
 
 // --- API Routes ---
-
-// Root endpoint - API status
 app.get('/', (req, res) => {
     res.json({ 
         message: 'SportsHub Backend API', 
         status: 'Running',
-        version: '1.0.0',
+        version: '2.0.0',
         timestamp: new Date(),
         endpoints: {
             events: '/api/events',
             auth: {
                 register: 'POST /api/register',
-                login: 'POST /api/login'
+                login: 'POST /api/login',
+                refresh: 'POST /api/auth/refresh',
+                logout: 'POST /api/logout'
             },
             admin: '/admin',
             health: '/health'
@@ -297,71 +356,8 @@ app.get('/', (req, res) => {
     });
 });
 
-// Health check endpoint
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date() });
-});
-
-// API documentation endpoint
-app.get('/api', (req, res) => {
-    res.json({
-        message: 'SportsHub API Documentation',
-        version: '1.0.0',
-        endpoints: {
-            'GET /api/events': 'Get all events',
-            'POST /api/register': 'Register new user',
-            'POST /api/login': 'User login',
-            'POST /api/events/:id/join': 'Join event team',
-            'POST /api/teams/leave': 'Leave team',
-            'POST /api/profile/update': 'Update user profile',
-            'GET /api/chat/:teamName': 'Get chat messages',
-            'POST /api/notifications/mark-read': 'Mark notifications as read'
-        }
-    });
-});
-
-// Seed admin endpoint
-app.get('/api/seed-admin', async (req, res) => {
-    try {
-        await initializeDefaultAdmin();
-        res.status(200).send('Default admin creation process completed. You can now log in.');
-    } catch (error) {
-        res.status(500).send('Failed to seed admin.');
-    }
-});
-
-// Seed events endpoint
-app.get('/api/seed-events', async (req, res) => {
-    try {
-        await eventsCollection.deleteMany({});
-        await initializeDefaultEvents();
-        res.status(200).send('Events have been successfully added to the database!');
-    } catch (error) {
-        console.error('Seeding error:', error);
-        res.status(500).json({ message: 'Failed to seed events.' });
-    }
-});
-
-// Get all events
-app.get('/api/events', async (req, res) => {
-    try {
-        const events = await eventsCollection.find({}).sort({ id: 1 }).toArray();
-        
-        // Ensure all events have proper IDs
-        const eventsWithIds = events.map((event, index) => {
-            if (!event.id && event.id !== 0) {
-                console.warn(`Event missing ID, assigning ID: ${index + 1}`, event.name);
-                event.id = index + 1;
-            }
-            return event;
-        });
-        
-        console.log(`Returning ${eventsWithIds.length} events to frontend`);
-        res.json(eventsWithIds);
-    } catch (error) {
-        console.error('Error fetching events:', error);
-        res.status(500).json({ message: 'Failed to fetch events' });
-    }
 });
 
 // Register new user
@@ -369,12 +365,10 @@ app.post('/api/register', async (req, res) => {
     try {
         const { fullName, studentID, email, password } = req.body;
         
-        // Validate required fields
         if (!fullName || !studentID || !email || !password) {
             return res.status(400).json({ message: "All fields are required." });
         }
         
-        // Check if user already exists
         const existingUser = await usersCollection.findOne({
             $or: [{ email: email }, { studentID: studentID }]
         });
@@ -387,11 +381,9 @@ app.post('/api/register', async (req, res) => {
             }
         }
         
-        // Hash password
         const salt = await bcrypt.genSalt(10);
         const hashedPassword = await bcrypt.hash(password, salt);
         
-        // Create new user
         const newUser = {
             fullName,
             studentID,
@@ -400,8 +392,9 @@ app.post('/api/register', async (req, res) => {
             mobileNumber: "",
             avatarUrl: null,
             joinedTeams: [],
+            tokenVersion: 0,
             notifications: [{
-                icon: "🏆",
+                icon: "🎉",
                 title: `Welcome ${fullName}!`,
                 body: "Your account has been created successfully. Explore events and join the fun.",
                 timestamp: new Date(),
@@ -448,8 +441,11 @@ app.post('/api/login', async (req, res) => {
             return res.status(400).json({ message: "Invalid credentials." });
         }
         
-        // Generate JWT token - THIS IS NEW
-        const token = generateToken(user);
+        // Generate tokens
+        const { accessToken, refreshToken } = generateTokens(user);
+        
+        // Store refresh token
+        await storeRefreshToken(user._id.toString(), refreshToken);
         
         await usersCollection.updateOne(
             { _id: user._id },
@@ -458,7 +454,7 @@ app.post('/api/login', async (req, res) => {
                 $push: {
                     notifications: {
                         $each: [{
-                            icon: "🏆",
+                            icon: "👋",
                             title: `Welcome back, ${user.fullName}!`,
                             body: "Ready to join some exciting tournaments?",
                             timestamp: new Date(),
@@ -481,11 +477,11 @@ app.post('/api/login', async (req, res) => {
             notifications: user.notifications || []
         };
         
-        // Return both user data and token - THIS IS NEW
         res.status(200).json({ 
             message: "Login successful!", 
             user: userToReturn,
-            token: token
+            accessToken: accessToken,
+            refreshToken: refreshToken
         });
         
     } catch (error) {
@@ -493,8 +489,69 @@ app.post('/api/login', async (req, res) => {
         res.status(500).json({ message: "Server error during login." });
     }
 });
+
+// Token refresh endpoint
+app.post('/api/auth/refresh', async (req, res) => {
+    try {
+        const { refreshToken } = req.body;
+        
+        if (!refreshToken) {
+            return res.status(401).json({ message: 'Refresh token required' });
+        }
+        
+        // Verify refresh token
+        const verifyResult = verifyRefreshToken(refreshToken);
+        if (!verifyResult.success) {
+            return res.status(403).json({ message: 'Invalid refresh token' });
+        }
+        
+        // Check if refresh token exists in database
+        const isValid = await isRefreshTokenValid(refreshToken);
+        if (!isValid) {
+            return res.status(403).json({ message: 'Refresh token not found or expired' });
+        }
+        
+        // Get user
+        const user = await usersCollection.findOne({ _id: new ObjectId(verifyResult.data.id) });
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+        
+        // Check token version (for logout all functionality)
+        if (user.tokenVersion !== verifyResult.data.tokenVersion) {
+            return res.status(403).json({ message: 'Token version mismatch' });
+        }
+        
+        // Generate new tokens
+        const { accessToken, refreshToken: newRefreshToken } = generateTokens(user);
+        
+        // Remove old refresh token and store new one
+        await removeRefreshToken(refreshToken);
+        await storeRefreshToken(user._id.toString(), newRefreshToken);
+        
+        res.json({
+            accessToken: accessToken,
+            refreshToken: newRefreshToken
+        });
+        
+    } catch (error) {
+        console.error('Token refresh error:', error);
+        res.status(500).json({ message: 'Failed to refresh token' });
+    }
+});
+
+// Logout
 app.post('/api/logout', authenticateToken, async (req, res) => {
     try {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1];
+        
+        // If refresh token is provided, remove it
+        const { refreshToken } = req.body;
+        if (refreshToken) {
+            await removeRefreshToken(refreshToken);
+        }
+        
         console.log(`User ${req.user.fullName} logged out`);
         res.status(200).json({ message: 'Logged out successfully' });
     } catch (error) {
@@ -502,28 +559,24 @@ app.post('/api/logout', authenticateToken, async (req, res) => {
         res.status(500).json({ message: 'Failed to logout' });
     }
 });
-// Add this new endpoint to server.js
-app.post('/api/profile/avatar-upload', upload.single('avatar'), async (req, res) => {
+
+// Avatar upload
+app.post('/api/profile/avatar-upload', authenticateToken, upload.single('avatar'), async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ message: 'No file uploaded.' });
         }
 
-        // Upload the file to Cloudinary
         const result = await cloudinary.uploader.upload(req.file.path, {
-            folder: "sports-hub-avatars" // Optional: organize uploads in Cloudinary
+            folder: "sports-hub-avatars"
         });
-
-        // The user's email will be sent along with the file to identify them
-        const { userEmail } = req.body;
         
-        // Update the user's document in MongoDB with the new avatar URL
         await usersCollection.updateOne(
-            { email: userEmail },
+            { email: req.user.email },
             { $set: { avatarUrl: result.secure_url } }
         );
 
-        console.log(`Avatar updated for ${userEmail}`);
+        console.log(`Avatar updated for ${req.user.email}`);
         res.status(200).json({ 
             message: "Avatar updated successfully!", 
             avatarUrl: result.secure_url
@@ -536,20 +589,10 @@ app.post('/api/profile/avatar-upload', upload.single('avatar'), async (req, res)
 });
 
 // Mark notifications as read
-// In server.js, replace the existing /api/notifications/mark-read endpoint
-
-app.post('/api/notifications/mark-read', async (req, res) => {
+app.post('/api/notifications/mark-read', authenticateToken, async (req, res) => {
     try {
-        const { userEmail } = req.body;
-        
-        if (!userEmail) {
-            return res.status(400).json({ message: 'User email is required.' });
-        }
-        
-        // This query finds the user and sets the 'read' field to true 
-        // for all sub-documents in the 'notifications' array.
-        const result = await usersCollection.updateMany(
-            { email: userEmail },
+        const result = await usersCollection.updateOne(
+            { email: req.user.email },
             { $set: { "notifications.$[].read": true } }
         );
         
@@ -557,11 +600,32 @@ app.post('/api/notifications/mark-read', async (req, res) => {
             return res.status(404).json({ message: 'User not found.' });
         }
         
-        console.log(`Marked notifications as read for ${userEmail}`);
+        console.log(`Marked notifications as read for ${req.user.email}`);
         res.status(200).json({ message: 'Notifications marked as read.' });
     } catch (error) {
         console.error('Error marking notifications as read:', error);
         res.status(500).json({ message: 'Failed to mark notifications as read.' });
+    }
+});
+
+// Get all events
+app.get('/api/events', async (req, res) => {
+    try {
+        const events = await eventsCollection.find({}).sort({ id: 1 }).toArray();
+        
+        const eventsWithIds = events.map((event, index) => {
+            if (!event.id && event.id !== 0) {
+                console.warn(`Event missing ID, assigning ID: ${index + 1}`, event.name);
+                event.id = index + 1;
+            }
+            return event;
+        });
+        
+        console.log(`Returning ${eventsWithIds.length} events to frontend`);
+        res.json(eventsWithIds);
+    } catch (error) {
+        console.error('Error fetching events:', error);
+        res.status(500).json({ message: 'Failed to fetch events' });
     }
 });
 
@@ -571,7 +635,6 @@ app.post('/api/events/:eventId/join', authenticateToken, async (req, res) => {
         const { eventId } = req.params;
         const { userRegNumber, userExperience } = req.body;
         
-        // Get user info from the token instead of request body
         const userFullName = req.user.fullName;
         
         console.log('Join request - Event ID:', eventId);
@@ -658,16 +721,15 @@ app.post('/api/events/:eventId/join', authenticateToken, async (req, res) => {
 });
 
 // Leave team
-app.post('/api/teams/leave', async (req, res) => {
+app.post('/api/teams/leave', authenticateToken, async (req, res) => {
     try {
-        const { userFullName, teamName } = req.body;
+        const { teamName } = req.body;
+        const userFullName = req.user.fullName;
         
-        // Validate required fields
-        if (!userFullName || !teamName) {
-            return res.status(400).json({ message: "User name and team name are required." });
+        if (!teamName) {
+            return res.status(400).json({ message: "Team name is required." });
         }
         
-        // Find and update the event
         const updateResult = await eventsCollection.updateOne(
             { "team.name": teamName },
             { 
@@ -684,7 +746,6 @@ app.post('/api/teams/leave', async (req, res) => {
             return res.status(400).json({ message: 'You were not a member of this team.' });
         }
         
-        // Remove team from user's joined teams
         await usersCollection.updateOne(
             { fullName: userFullName },
             { 
@@ -702,17 +763,16 @@ app.post('/api/teams/leave', async (req, res) => {
 });
 
 // Update user profile
-app.post('/api/profile/update', async (req, res) => {
+app.post('/api/profile/update', authenticateToken, async (req, res) => {
     try {
-        const { email, fullName, mobileNumber } = req.body;
+        const { fullName, mobileNumber } = req.body;
         
-        // Validate required fields
-        if (!email || !fullName) {
-            return res.status(400).json({ message: "Email and full name are required." });
+        if (!fullName) {
+            return res.status(400).json({ message: "Full name is required." });
         }
         
         const updateResult = await usersCollection.findOneAndUpdate(
-            { email: email },
+            { email: req.user.email },
             { 
                 $set: { 
                     fullName: fullName,
@@ -736,7 +796,7 @@ app.post('/api/profile/update', async (req, res) => {
             mobileNumber: user.mobileNumber
         };
         
-        console.log("Profile updated for:", email);
+        console.log("Profile updated for:", req.user.email);
         res.status(200).json({ message: "Profile updated successfully!", user: userToReturn });
     } catch (error) {
         console.error('Profile update error:', error);
@@ -745,7 +805,7 @@ app.post('/api/profile/update', async (req, res) => {
 });
 
 // Get chat messages for a team
-app.get('/api/chat/:teamName', async (req, res) => {
+app.get('/api/chat/:teamName', authenticateToken, async (req, res) => {
     try {
         const { teamName } = req.params;
         const messages = await chatMessagesCollection
@@ -762,8 +822,6 @@ app.get('/api/chat/:teamName', async (req, res) => {
 });
 
 // --- ADMIN ROUTES ---
-
-// Serve admin panel
 app.get('/admin', (req, res) => {
     res.send(`
         <html>
@@ -796,6 +854,9 @@ app.post('/api/admin/login', async (req, res) => {
             return res.status(400).json({ message: "Invalid admin credentials." });
         }
         
+        const { accessToken, refreshToken } = generateTokens(admin);
+        await storeRefreshToken(admin._id.toString(), refreshToken);
+        
         await adminsCollection.updateOne(
             { _id: admin._id },
             { $set: { lastLogin: new Date() } }
@@ -809,16 +870,25 @@ app.post('/api/admin/login', async (req, res) => {
         };
         
         console.log('Admin logged in:', admin.email);
-        res.status(200).json({ message: "Admin login successful!", admin: adminToReturn });
+        res.status(200).json({ 
+            message: "Admin login successful!", 
+            admin: adminToReturn,
+            accessToken: accessToken,
+            refreshToken: refreshToken
+        });
     } catch (error) {
         console.error('Admin login error:', error);
         res.status(500).json({ message: "Server error during admin login." });
     }
 });
 
-// Admin endpoint to create a new event
-app.post('/api/admin/events', async (req, res) => {
+// Admin create event
+app.post('/api/admin/events', authenticateToken, async (req, res) => {
     try {
+        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        
         const eventData = req.body;
         
         if (!eventData.name || !eventData.teamName) {
@@ -856,9 +926,13 @@ app.post('/api/admin/events', async (req, res) => {
     }
 });
 
-// Admin endpoint to delete an event
-app.delete('/api/admin/events/:eventId', async (req, res) => {
+// Admin delete event
+app.delete('/api/admin/events/:eventId', authenticateToken, async (req, res) => {
     try {
+        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        
         const eventId = parseInt(req.params.eventId);
         if (isNaN(eventId)) {
             return res.status(400).json({ message: 'Invalid Event ID.' });
@@ -880,8 +954,12 @@ app.delete('/api/admin/events/:eventId', async (req, res) => {
 });
 
 // Admin send notifications
-app.post('/api/admin/notifications/send', async (req, res) => {
+app.post('/api/admin/notifications/send', authenticateToken, async (req, res) => {
     try {
+        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        
         const { title, message, icon, target, specificEmail } = req.body;
 
         if (!title || !message || !icon || !target) {
@@ -901,7 +979,6 @@ app.post('/api/admin/notifications/send', async (req, res) => {
         
         if (target === 'all') {
             targetQuery = {};
-            // Get all user emails for real-time delivery
             const users = await usersCollection.find({}, { projection: { email: 1 } }).toArray();
             targetUsers = users.map(user => user.email);
         } else if (target === 'specific') {
@@ -912,17 +989,15 @@ app.post('/api/admin/notifications/send', async (req, res) => {
             targetUsers = [specificEmail];
         }
 
-        // Update database
         const result = await usersCollection.updateMany(targetQuery, {
             $push: {
                 notifications: {
                     $each: [newNotification],
-                    $slice: -10 // Keep only the last 10 notifications
+                    $slice: -10
                 }
             }
         });
 
-        // Send real-time notifications
         let realTimeDelivered = 0;
         targetUsers.forEach(email => {
             if (sendRealTimeNotification(email, newNotification)) {
@@ -944,8 +1019,12 @@ app.post('/api/admin/notifications/send', async (req, res) => {
 });
 
 // Get all users (Admin only)
-app.get('/api/admin/users', async (req, res) => {
+app.get('/api/admin/users', authenticateToken, async (req, res) => {
     try {
+        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        
         const users = await usersCollection
             .find({}, { projection: { password: 0 } })
             .sort({ createdAt: -1 })
@@ -959,59 +1038,17 @@ app.get('/api/admin/users', async (req, res) => {
 });
 
 // Get all events (Admin only)
-app.get('/api/admin/events', async (req, res) => {
+app.get('/api/admin/events', authenticateToken, async (req, res) => {
     try {
+        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        
         const events = await eventsCollection.find({}).sort({ id: 1 }).toArray();
         res.json(events);
     } catch (error) {
         console.error('Error fetching events:', error);
         res.status(500).json({ message: 'Failed to fetch events' });
-    }
-});
-
-// Get categories
-app.get('/api/admin/categories', async (req, res) => {
-    try {
-        const categories = await categoriesCollection.find({}).sort({ name: 1 }).toArray();
-        res.json(categories);
-    } catch (error) {
-        res.status(500).json({ message: 'Failed to fetch categories.' });
-    }
-});
-
-// Add category
-app.post('/api/admin/categories', async (req, res) => {
-    try {
-        const { name } = req.body;
-        if (!name) {
-            return res.status(400).json({ message: 'Category name is required.' });
-        }
-        const existingCategory = await categoriesCollection.findOne({ name: name });
-        if (existingCategory) {
-            return res.status(400).json({ message: 'This category already exists.' });
-        }
-        const newCategory = { name: name, createdAt: new Date() };
-        await categoriesCollection.insertOne(newCategory);
-        res.status(201).json({ message: 'Category added successfully!', category: newCategory });
-    } catch (error) {
-        res.status(500).json({ message: 'Failed to add category.' });
-    }
-});
-
-// Delete category
-app.delete('/api/admin/categories/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).json({ message: 'Invalid category ID format.' });
-        }
-        const result = await categoriesCollection.deleteOne({ _id: new ObjectId(id) });
-        if (result.deletedCount === 0) {
-            return res.status(404).json({ message: 'Category not found.' });
-        }
-        res.status(200).json({ message: 'Category deleted successfully.' });
-    } catch (error) {
-        res.status(500).json({ message: 'Failed to delete category.' });
     }
 });
 
@@ -1047,7 +1084,6 @@ wss.on('connection', (ws, req) => {
     }
 });
 
-// Handle notification WebSocket connections
 function handleNotificationConnection(ws) {
     console.log('New notification WebSocket client connected');
     
@@ -1065,7 +1101,6 @@ function handleNotificationConnection(ws) {
     });
     
     ws.on('close', () => {
-        // Remove this connection from all registered users
         for (const [email, connection] of notificationClients.entries()) {
             if (connection === ws) {
                 notificationClients.delete(email);
@@ -1076,7 +1111,6 @@ function handleNotificationConnection(ws) {
     });
 }
 
-// Handle chat WebSocket connections
 function handleChatConnection(ws) {
     console.log('New chat WebSocket client connected');
     ws.teamName = null;
@@ -1135,6 +1169,7 @@ async function startServer() {
             console.log(`📊 Database: Connected to MongoDB Atlas`);
             console.log(`💬 WebSocket: Real-time chat enabled`);
             console.log(`🔔 Notifications: Real-time delivery enabled`);
+            console.log(`🔐 JWT: Access/Refresh token authentication enabled`);
             console.log(`🏆 Ready for sports management!`);
         });
     } catch (error) {
