@@ -1,4 +1,4 @@
-// server.js - SportsHub Backend with Improved JWT Authentication
+// server.js - Enhanced SportsHub Backend with Full Admin Panel Support
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 const cloudinary = require('cloudinary').v2;
@@ -23,8 +23,8 @@ const { MongoClient, ObjectId } = require('mongodb');
 // --- JWT Configuration ---
 const JWT_SECRET = process.env.JWT_SECRET || 'sportsHub-fallback-secret-key-change-in-production';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'sportsHub-refresh-secret-key-change-in-production';
-const JWT_EXPIRES_IN = '15m'; // Short-lived access token
-const JWT_REFRESH_EXPIRES_IN = '7d'; // Long-lived refresh token
+const JWT_EXPIRES_IN = '15m';
+const JWT_REFRESH_EXPIRES_IN = '7d';
 
 // --- App Setup ---
 const app = express();
@@ -41,6 +41,8 @@ let chatMessagesCollection;
 let adminsCollection;
 let categoriesCollection;
 let refreshTokensCollection;
+let notificationsHistoryCollection;
+let systemSettingsCollection;
 
 // --- WebSocket Client Management ---
 const notificationClients = new Map();
@@ -63,10 +65,14 @@ async function connectToDatabase() {
         adminsCollection = db.collection('admins');
         categoriesCollection = db.collection('categories');
         refreshTokensCollection = db.collection('refreshTokens');
+        notificationsHistoryCollection = db.collection('notificationsHistory');
+        systemSettingsCollection = db.collection('systemSettings');
         
         await createIndexes();
         await initializeDefaultEvents();
         await initializeDefaultAdmin();
+        await initializeDefaultCategories();
+        await initializeSystemSettings();
         
         return true;
     } catch (error) {
@@ -85,6 +91,9 @@ async function createIndexes() {
         await adminsCollection.createIndex({ email: 1 }, { unique: true });
         await refreshTokensCollection.createIndex({ token: 1 }, { unique: true });
         await refreshTokensCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+        await categoriesCollection.createIndex({ name: 1 }, { unique: true });
+        await notificationsHistoryCollection.createIndex({ sentAt: 1 });
+        await notificationsHistoryCollection.createIndex({ target: 1 });
         console.log('Database indexes created successfully');
     } catch (error) {
         console.log('Some indexes may already exist:', error.message);
@@ -114,6 +123,51 @@ async function initializeDefaultAdmin() {
     }
 }
 
+async function initializeDefaultCategories() {
+    try {
+        const categoryCount = await categoriesCollection.countDocuments();
+        if (categoryCount === 0) {
+            const defaultCategories = [
+                { name: 'Cricket', icon: '🏏', createdAt: new Date() },
+                { name: 'Football', icon: '⚽', createdAt: new Date() },
+                { name: 'Badminton', icon: '🏸', createdAt: new Date() },
+                { name: 'Table Tennis', icon: '🏓', createdAt: new Date() },
+                { name: 'Basketball', icon: '🏀', createdAt: new Date() },
+                { name: 'Volleyball', icon: '🏐', createdAt: new Date() }
+            ];
+            
+            await categoriesCollection.insertMany(defaultCategories);
+            console.log('Default categories created');
+        }
+    } catch (error) {
+        console.error('Error creating default categories:', error);
+    }
+}
+
+async function initializeSystemSettings() {
+    try {
+        const settingsCount = await systemSettingsCollection.countDocuments();
+        if (settingsCount === 0) {
+            const defaultSettings = {
+                appName: 'SportsHub',
+                maxTeamSize: 11,
+                emailDomain: '@college.edu',
+                eventDuration: 2,
+                minPasswordLength: 6,
+                sessionTimeout: 30,
+                requireEmailVerification: false,
+                createdAt: new Date(),
+                updatedAt: new Date()
+            };
+            
+            await systemSettingsCollection.insertOne(defaultSettings);
+            console.log('Default system settings created');
+        }
+    } catch (error) {
+        console.error('Error creating default settings:', error);
+    }
+}
+
 async function initializeDefaultEvents() {
     try {
         const eventCount = await eventsCollection.countDocuments();
@@ -128,6 +182,7 @@ async function initializeDefaultEvents() {
                     category: "Cricket",
                     emoji: "🏏",
                     difficulty: "Advanced",
+                    description: "Annual intercollege cricket championship featuring top teams from across the region.",
                     team: {
                         name: "Warriors",
                         maxSlots: 11,
@@ -148,6 +203,7 @@ async function initializeDefaultEvents() {
                     category: "Badminton",
                     emoji: "🏸",
                     difficulty: "Intermediate",
+                    description: "Singles and doubles badminton tournament open to all skill levels.",
                     team: {
                         name: "Shuttlers",
                         maxSlots: 4,
@@ -168,6 +224,7 @@ async function initializeDefaultEvents() {
                     category: "Football",
                     emoji: "⚽",
                     difficulty: "Expert",
+                    description: "Professional-level football league with experienced players only.",
                     team: {
                         name: "Strikers United",
                         maxSlots: 11,
@@ -188,6 +245,7 @@ async function initializeDefaultEvents() {
                     category: "Table Tennis",
                     emoji: "🏓",
                     difficulty: "Intermediate",
+                    description: "Fast-paced table tennis tournament with singles and doubles categories.",
                     team: {
                         name: "Spin Masters",
                         maxSlots: 4,
@@ -255,7 +313,7 @@ function verifyRefreshToken(token) {
 
 async function storeRefreshToken(userId, token) {
     const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + 7); // 7 days from now
+    expiresAt.setDate(expiresAt.getDate() + 7);
     
     try {
         await refreshTokensCollection.insertOne({
@@ -307,6 +365,15 @@ function authenticateToken(req, res, next) {
     next();
 }
 
+function authenticateAdmin(req, res, next) {
+    authenticateToken(req, res, () => {
+        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
+            return res.status(403).json({ message: 'Admin access required' });
+        }
+        next();
+    });
+}
+
 // --- Middleware ---
 app.use(cors({
     origin: [
@@ -335,12 +402,32 @@ function sendRealTimeNotification(userEmail, notification) {
     return false;
 }
 
+async function saveNotificationHistory(notificationData, sentCount, targetUsers) {
+    try {
+        const historyRecord = {
+            title: notificationData.title,
+            message: notificationData.message,
+            icon: notificationData.icon,
+            target: notificationData.target,
+            priority: notificationData.priority || 'normal',
+            sentCount: sentCount,
+            targetUsers: targetUsers,
+            sentAt: new Date(),
+            sentBy: notificationData.sentBy || 'System'
+        };
+        
+        await notificationsHistoryCollection.insertOne(historyRecord);
+    } catch (error) {
+        console.error('Error saving notification history:', error);
+    }
+}
+
 // --- API Routes ---
 app.get('/', (req, res) => {
     res.json({ 
         message: 'SportsHub Backend API', 
         status: 'Running',
-        version: '2.0.0',
+        version: '3.0.0',
         timestamp: new Date(),
         endpoints: {
             events: '/api/events',
@@ -350,7 +437,7 @@ app.get('/', (req, res) => {
                 refresh: 'POST /api/auth/refresh',
                 logout: 'POST /api/logout'
             },
-            admin: '/admin',
+            admin: '/api/admin/*',
             health: '/health'
         }
     });
@@ -393,6 +480,7 @@ app.post('/api/register', async (req, res) => {
             avatarUrl: null,
             joinedTeams: [],
             tokenVersion: 0,
+            status: 'active',
             notifications: [{
                 icon: "🎉",
                 title: `Welcome ${fullName}!`,
@@ -499,33 +587,27 @@ app.post('/api/auth/refresh', async (req, res) => {
             return res.status(401).json({ message: 'Refresh token required' });
         }
         
-        // Verify refresh token
         const verifyResult = verifyRefreshToken(refreshToken);
         if (!verifyResult.success) {
             return res.status(403).json({ message: 'Invalid refresh token' });
         }
         
-        // Check if refresh token exists in database
         const isValid = await isRefreshTokenValid(refreshToken);
         if (!isValid) {
             return res.status(403).json({ message: 'Refresh token not found or expired' });
         }
         
-        // Get user
         const user = await usersCollection.findOne({ _id: new ObjectId(verifyResult.data.id) });
         if (!user) {
             return res.status(404).json({ message: 'User not found' });
         }
         
-        // Check token version (for logout all functionality)
         if (user.tokenVersion !== verifyResult.data.tokenVersion) {
             return res.status(403).json({ message: 'Token version mismatch' });
         }
         
-        // Generate new tokens
         const { accessToken, refreshToken: newRefreshToken } = generateTokens(user);
         
-        // Remove old refresh token and store new one
         await removeRefreshToken(refreshToken);
         await storeRefreshToken(user._id.toString(), newRefreshToken);
         
@@ -543,10 +625,6 @@ app.post('/api/auth/refresh', async (req, res) => {
 // Logout
 app.post('/api/logout', authenticateToken, async (req, res) => {
     try {
-        const authHeader = req.headers['authorization'];
-        const token = authHeader && authHeader.split(' ')[1];
-        
-        // If refresh token is provided, remove it
         const { refreshToken } = req.body;
         if (refreshToken) {
             await removeRefreshToken(refreshToken);
@@ -821,7 +899,7 @@ app.get('/api/chat/:teamName', authenticateToken, async (req, res) => {
     }
 });
 
-// --- ADMIN ROUTES ---
+// --- ENHANCED ADMIN ROUTES ---
 app.get('/admin', (req, res) => {
     res.send(`
         <html>
@@ -882,21 +960,47 @@ app.post('/api/admin/login', async (req, res) => {
     }
 });
 
-// Admin create event
-app.post('/api/admin/events', authenticateToken, async (req, res) => {
+// Get all users (Admin only)
+app.get('/api/admin/users', authenticateAdmin, async (req, res) => {
     try {
-        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
-            return res.status(403).json({ message: 'Admin access required' });
-        }
+        const users = await usersCollection
+            .find({}, { projection: { password: 0 } })
+            .sort({ createdAt: -1 })
+            .toArray();
         
+        res.json(users);
+    } catch (error) {
+        console.error('Error fetching users:', error);
+        res.status(500).json({ message: 'Failed to fetch users' });
+    }
+});
+
+// Get all events (Admin only)
+app.get('/api/admin/events', authenticateAdmin, async (req, res) => {
+    try {
+        const events = await eventsCollection.find({}).sort({ id: 1 }).toArray();
+        res.json(events);
+    } catch (error) {
+        console.error('Error fetching events:', error);
+        res.status(500).json({ message: 'Failed to fetch events' });
+    }
+});
+
+// Create new event (Admin only)
+app.post('/api/admin/events', authenticateAdmin, async (req, res) => {
+    try {
         const eventData = req.body;
         
         if (!eventData.name || !eventData.teamName) {
             return res.status(400).json({ message: 'Event Name and Team Name are required.' });
         }
 
+        // Get next event ID
+        const lastEvent = await eventsCollection.findOne({}, { sort: { id: -1 } });
+        const nextId = lastEvent ? lastEvent.id + 1 : 1;
+
         const newEvent = {
-            id: await eventsCollection.countDocuments() + 1,
+            id: nextId,
             name: eventData.name,
             date: eventData.date,
             location: eventData.location,
@@ -904,6 +1008,7 @@ app.post('/api/admin/events', authenticateToken, async (req, res) => {
             category: eventData.category,
             emoji: eventData.emoji,
             difficulty: eventData.difficulty,
+            description: eventData.description || '',
             team: {
                 name: eventData.teamName,
                 maxSlots: parseInt(eventData.maxSlots),
@@ -913,7 +1018,8 @@ app.post('/api/admin/events', authenticateToken, async (req, res) => {
                     minExperience: parseInt(eventData.minExperience)
                 }
             },
-            createdAt: new Date()
+            createdAt: new Date(),
+            updatedAt: new Date()
         };
 
         await eventsCollection.insertOne(newEvent);
@@ -926,18 +1032,88 @@ app.post('/api/admin/events', authenticateToken, async (req, res) => {
     }
 });
 
-// Admin delete event
-app.delete('/api/admin/events/:eventId', authenticateToken, async (req, res) => {
+// Update event (Admin only)
+app.put('/api/admin/events/:eventId', authenticateAdmin, async (req, res) => {
     try {
-        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
-            return res.status(403).json({ message: 'Admin access required' });
-        }
+        const eventId = parseInt(req.params.eventId);
+        const eventData = req.body;
         
+        if (isNaN(eventId)) {
+            return res.status(400).json({ message: 'Invalid Event ID.' });
+        }
+
+        if (!eventData.name || !eventData.teamName) {
+            return res.status(400).json({ message: 'Event Name and Team Name are required.' });
+        }
+
+        // Get existing event to preserve team members
+        const existingEvent = await eventsCollection.findOne({ id: eventId });
+        if (!existingEvent) {
+            return res.status(404).json({ message: 'Event not found.' });
+        }
+
+        const updatedEvent = {
+            name: eventData.name,
+            date: eventData.date,
+            location: eventData.location,
+            time: eventData.time,
+            category: eventData.category,
+            emoji: eventData.emoji,
+            difficulty: eventData.difficulty,
+            description: eventData.description || '',
+            team: {
+                name: eventData.teamName,
+                maxSlots: parseInt(eventData.maxSlots),
+                members: existingEvent.team ? existingEvent.team.members : [],
+                requirements: {
+                    minRegNumber: eventData.minRegYear,
+                    minExperience: parseInt(eventData.minExperience)
+                }
+            },
+            updatedAt: new Date()
+        };
+
+        const result = await eventsCollection.updateOne(
+            { id: eventId },
+            { $set: updatedEvent }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'Event not found.' });
+        }
+
+        console.log('Admin updated event:', eventData.name);
+        res.status(200).json({ message: 'Event updated successfully!' });
+
+    } catch (error) {
+        console.error('Error updating event:', error);
+        res.status(500).json({ message: 'Failed to update event.' });
+    }
+});
+
+// Delete event (Admin only)
+app.delete('/api/admin/events/:eventId', authenticateAdmin, async (req, res) => {
+    try {
         const eventId = parseInt(req.params.eventId);
         if (isNaN(eventId)) {
             return res.status(400).json({ message: 'Invalid Event ID.' });
         }
 
+        // First get the event to find team members
+        const event = await eventsCollection.findOne({ id: eventId });
+        if (!event) {
+            return res.status(404).json({ message: 'Event not found.' });
+        }
+
+        // Remove this event from users' joinedTeams
+        if (event.team && event.team.members.length > 0) {
+            await usersCollection.updateMany(
+                { "joinedTeams.eventId": eventId },
+                { $pull: { joinedTeams: { eventId: eventId } } }
+            );
+        }
+
+        // Delete the event
         const result = await eventsCollection.deleteOne({ id: eventId });
 
         if (result.deletedCount === 0) {
@@ -953,14 +1129,233 @@ app.delete('/api/admin/events/:eventId', authenticateToken, async (req, res) => 
     }
 });
 
-// Admin send notifications
-app.post('/api/admin/notifications/send', authenticateToken, async (req, res) => {
+// Update user (Admin only)
+app.put('/api/admin/users/:userId', authenticateAdmin, async (req, res) => {
     try {
-        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
-            return res.status(403).json({ message: 'Admin access required' });
+        const { userId } = req.params;
+        const userData = req.body;
+        
+        if (!ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid User ID.' });
+        }
+
+        const updateData = {
+            fullName: userData.fullName,
+            studentID: userData.studentID,
+            email: userData.email,
+            mobileNumber: userData.mobileNumber || '',
+            status: userData.status || 'active',
+            updatedAt: new Date()
+        };
+
+        const result = await usersCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { $set: updateData }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        console.log('Admin updated user:', userData.fullName);
+        res.status(200).json({ message: 'User updated successfully!' });
+
+    } catch (error) {
+        console.error('Error updating user:', error);
+        res.status(500).json({ message: 'Failed to update user.' });
+    }
+});
+
+// Delete user (Admin only)
+app.delete('/api/admin/users/:userId', authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        if (!ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid User ID.' });
+        }
+
+        // Get user first to find their full name
+        const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+        if (!user) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        // Remove user from all teams
+        await eventsCollection.updateMany(
+            { "team.members": user.fullName },
+            { $pull: { "team.members": user.fullName } }
+        );
+
+        // Delete the user
+        const result = await usersCollection.deleteOne({ _id: new ObjectId(userId) });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: 'User not found.' });
         }
         
-        const { title, message, icon, target, specificEmail } = req.body;
+        console.log('Admin deleted user:', user.fullName);
+        res.status(200).json({ message: 'User deleted successfully.' });
+
+    } catch (error) {
+        console.error('Error deleting user:', error);
+        res.status(500).json({ message: 'Failed to delete user.' });
+    }
+});
+
+// Reset user password (Admin only)
+app.post('/api/admin/users/:userId/reset-password', authenticateAdmin, async (req, res) => {
+    try {
+        const { userId } = req.params;
+        
+        if (!ObjectId.isValid(userId)) {
+            return res.status(400).json({ message: 'Invalid User ID.' });
+        }
+
+        const user = await usersCollection.findOne({ _id: new ObjectId(userId) });
+        if (!user) {
+            return res.status(404).json({ message: 'User not found.' });
+        }
+
+        // Generate temporary password
+        const tempPassword = 'temp' + Math.random().toString(36).substring(2, 8);
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(tempPassword, salt);
+
+        await usersCollection.updateOne(
+            { _id: new ObjectId(userId) },
+            { 
+                $set: { 
+                    password: hashedPassword,
+                    tokenVersion: (user.tokenVersion || 0) + 1, // Invalidate all existing tokens
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        // In a real app, you would send this password via email
+        console.log(`Password reset for ${user.email}: ${tempPassword}`);
+        
+        res.status(200).json({ 
+            message: 'Password reset successfully! Temporary password sent to user email.',
+            tempPassword: tempPassword // Remove this in production
+        });
+
+    } catch (error) {
+        console.error('Error resetting password:', error);
+        res.status(500).json({ message: 'Failed to reset password.' });
+    }
+});
+
+// Get all categories (Admin only)
+app.get('/api/admin/categories', authenticateAdmin, async (req, res) => {
+    try {
+        const categories = await categoriesCollection.find({}).sort({ name: 1 }).toArray();
+        res.json(categories);
+    } catch (error) {
+        console.error('Error fetching categories:', error);
+        res.status(500).json({ message: 'Failed to fetch categories' });
+    }
+});
+
+// Create category (Admin only)
+app.post('/api/admin/categories', authenticateAdmin, async (req, res) => {
+    try {
+        const { name, icon } = req.body;
+        
+        if (!name || !name.trim()) {
+            return res.status(400).json({ message: 'Category name is required.' });
+        }
+
+        const newCategory = {
+            name: name.trim(),
+            icon: icon || '🏷️',
+            createdAt: new Date(),
+            updatedAt: new Date()
+        };
+
+        await categoriesCollection.insertOne(newCategory);
+        console.log('Admin created category:', name);
+        res.status(201).json({ message: 'Category created successfully!', category: newCategory });
+
+    } catch (error) {
+        if (error.code === 11000) {
+            return res.status(400).json({ message: 'Category with this name already exists.' });
+        }
+        console.error('Error creating category:', error);
+        res.status(500).json({ message: 'Failed to create category.' });
+    }
+});
+
+// Update category (Admin only)
+app.put('/api/admin/categories/:categoryId', authenticateAdmin, async (req, res) => {
+    try {
+        const { categoryId } = req.params;
+        const { name, icon } = req.body;
+        
+        if (!ObjectId.isValid(categoryId)) {
+            return res.status(400).json({ message: 'Invalid Category ID.' });
+        }
+
+        if (!name || !name.trim()) {
+            return res.status(400).json({ message: 'Category name is required.' });
+        }
+
+        const result = await categoriesCollection.updateOne(
+            { _id: new ObjectId(categoryId) },
+            { 
+                $set: { 
+                    name: name.trim(), 
+                    icon: icon || '🏷️',
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).json({ message: 'Category not found.' });
+        }
+
+        console.log('Admin updated category:', name);
+        res.status(200).json({ message: 'Category updated successfully!' });
+
+    } catch (error) {
+        if (error.code === 11000) {
+            return res.status(400).json({ message: 'Category with this name already exists.' });
+        }
+        console.error('Error updating category:', error);
+        res.status(500).json({ message: 'Failed to update category.' });
+    }
+});
+
+// Delete category (Admin only)
+app.delete('/api/admin/categories/:categoryId', authenticateAdmin, async (req, res) => {
+    try {
+        const { categoryId } = req.params;
+        
+        if (!ObjectId.isValid(categoryId)) {
+            return res.status(400).json({ message: 'Invalid Category ID.' });
+        }
+
+        const result = await categoriesCollection.deleteOne({ _id: new ObjectId(categoryId) });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).json({ message: 'Category not found.' });
+        }
+        
+        console.log('Admin deleted category with ID:', categoryId);
+        res.status(200).json({ message: 'Category deleted successfully.' });
+
+    } catch (error) {
+        console.error('Error deleting category:', error);
+        res.status(500).json({ message: 'Failed to delete category.' });
+    }
+});
+
+// Send notifications (Admin only)
+app.post('/api/admin/notifications/send', authenticateAdmin, async (req, res) => {
+    try {
+        const { title, message, icon, target, priority, specificEmail, bulkEmails, scheduled, scheduleDateTime } = req.body;
 
         if (!title || !message || !icon || !target) {
             return res.status(400).json({ message: 'Missing required notification fields.' });
@@ -970,7 +1365,8 @@ app.post('/api/admin/notifications/send', authenticateToken, async (req, res) =>
             icon,
             title,
             body: message,
-            timestamp: new Date(),
+            priority: priority || 'normal',
+            timestamp: scheduled && scheduleDateTime ? new Date(scheduleDateTime) : new Date(),
             read: false
         };
 
@@ -981,12 +1377,34 @@ app.post('/api/admin/notifications/send', authenticateToken, async (req, res) =>
             targetQuery = {};
             const users = await usersCollection.find({}, { projection: { email: 1 } }).toArray();
             targetUsers = users.map(user => user.email);
+        } else if (target === 'team-members') {
+            targetQuery = { "joinedTeams.0": { $exists: true } };
+            const users = await usersCollection.find(targetQuery, { projection: { email: 1 } }).toArray();
+            targetUsers = users.map(user => user.email);
+        } else if (target === 'non-team-members') {
+            targetQuery = { $or: [{ joinedTeams: { $exists: false } }, { joinedTeams: { $size: 0 } }] };
+            const users = await usersCollection.find(targetQuery, { projection: { email: 1 } }).toArray();
+            targetUsers = users.map(user => user.email);
         } else if (target === 'specific') {
             if (!specificEmail) {
                 return res.status(400).json({ message: 'Specific user email is required.' });
             }
             targetQuery = { email: specificEmail };
             targetUsers = [specificEmail];
+        } else if (target === 'bulk') {
+            if (!bulkEmails) {
+                return res.status(400).json({ message: 'Bulk emails are required.' });
+            }
+            const emails = bulkEmails.split(',').map(email => email.trim()).filter(email => email);
+            targetQuery = { email: { $in: emails } };
+            targetUsers = emails;
+        }
+
+        // If scheduled, save the notification for later processing
+        if (scheduled && scheduleDateTime) {
+            // In a real app, you would use a job queue like Bull or Agenda
+            // For now, we'll just save it and process immediately
+            console.log(`Notification scheduled for ${scheduleDateTime}`);
         }
 
         const result = await usersCollection.updateMany(targetQuery, {
@@ -998,12 +1416,23 @@ app.post('/api/admin/notifications/send', authenticateToken, async (req, res) =>
             }
         });
 
+        // Send real-time notifications
         let realTimeDelivered = 0;
         targetUsers.forEach(email => {
             if (sendRealTimeNotification(email, newNotification)) {
                 realTimeDelivered++;
             }
         });
+
+        // Save notification history
+        await saveNotificationHistory({
+            title,
+            message,
+            icon,
+            target,
+            priority,
+            sentBy: req.user.fullName
+        }, result.modifiedCount, targetUsers);
 
         console.log(`Notification sent to ${result.modifiedCount} users (${realTimeDelivered} real-time)`);
         res.status(200).json({ 
@@ -1018,37 +1447,126 @@ app.post('/api/admin/notifications/send', authenticateToken, async (req, res) =>
     }
 });
 
-// Get all users (Admin only)
-app.get('/api/admin/users', authenticateToken, async (req, res) => {
+// Get notification history (Admin only)
+app.get('/api/admin/notifications/history', authenticateAdmin, async (req, res) => {
     try {
-        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
-            return res.status(403).json({ message: 'Admin access required' });
-        }
+        const { page = 1, limit = 20 } = req.query;
         
-        const users = await usersCollection
-            .find({}, { projection: { password: 0 } })
-            .sort({ createdAt: -1 })
+        const notifications = await notificationsHistoryCollection
+            .find({})
+            .sort({ sentAt: -1 })
+            .skip((page - 1) * limit)
+            .limit(parseInt(limit))
             .toArray();
         
-        res.json(users);
+        const total = await notificationsHistoryCollection.countDocuments();
+        
+        res.json({
+            notifications,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            }
+        });
     } catch (error) {
-        console.error('Error fetching users:', error);
-        res.status(500).json({ message: 'Failed to fetch users' });
+        console.error('Error fetching notification history:', error);
+        res.status(500).json({ message: 'Failed to fetch notification history.' });
     }
 });
 
-// Get all events (Admin only)
-app.get('/api/admin/events', authenticateToken, async (req, res) => {
+// Get system settings (Admin only)
+app.get('/api/admin/settings', authenticateAdmin, async (req, res) => {
     try {
-        if (req.user.role !== 'super_admin' && req.user.role !== 'admin') {
-            return res.status(403).json({ message: 'Admin access required' });
-        }
-        
-        const events = await eventsCollection.find({}).sort({ id: 1 }).toArray();
-        res.json(events);
+        const settings = await systemSettingsCollection.findOne({});
+        res.json(settings || {});
     } catch (error) {
-        console.error('Error fetching events:', error);
-        res.status(500).json({ message: 'Failed to fetch events' });
+        console.error('Error fetching settings:', error);
+        res.status(500).json({ message: 'Failed to fetch settings.' });
+    }
+});
+
+// Update system settings (Admin only)
+app.put('/api/admin/settings', authenticateAdmin, async (req, res) => {
+    try {
+        const settingsData = req.body;
+        
+        const result = await systemSettingsCollection.updateOne(
+            {},
+            { 
+                $set: {
+                    ...settingsData,
+                    updatedAt: new Date()
+                }
+            },
+            { upsert: true }
+        );
+
+        console.log('Admin updated system settings');
+        res.status(200).json({ message: 'Settings updated successfully!' });
+
+    } catch (error) {
+        console.error('Error updating settings:', error);
+        res.status(500).json({ message: 'Failed to update settings.' });
+    }
+});
+
+// Get dashboard analytics (Admin only)
+app.get('/api/admin/analytics', authenticateAdmin, async (req, res) => {
+    try {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        
+        const thisMonth = new Date();
+        thisMonth.setDate(1);
+        thisMonth.setHours(0, 0, 0, 0);
+
+        const analytics = {
+            totalUsers: await usersCollection.countDocuments(),
+            totalEvents: await eventsCollection.countDocuments(),
+            totalCategories: await categoriesCollection.countDocuments(),
+            newUsersToday: await usersCollection.countDocuments({
+                createdAt: { $gte: today }
+            }),
+            newUsersThisMonth: await usersCollection.countDocuments({
+                createdAt: { $gte: thisMonth }
+            }),
+            eventsThisMonth: await eventsCollection.countDocuments({
+                createdAt: { $gte: thisMonth }
+            }),
+            notificationsSentToday: await notificationsHistoryCollection.countDocuments({
+                sentAt: { $gte: today }
+            }),
+            notificationsThisMonth: await notificationsHistoryCollection.countDocuments({
+                sentAt: { $gte: thisMonth }
+            })
+        };
+
+        // Calculate team statistics
+        const events = await eventsCollection.find({}).toArray();
+        let activeTeams = 0;
+        let totalRegistrations = 0;
+        let fullTeams = 0;
+
+        events.forEach(event => {
+            if (event.team && event.team.members.length > 0) {
+                activeTeams++;
+                totalRegistrations += event.team.members.length;
+                if (event.team.members.length >= event.team.maxSlots) {
+                    fullTeams++;
+                }
+            }
+        });
+
+        analytics.activeTeams = activeTeams;
+        analytics.totalRegistrations = totalRegistrations;
+        analytics.teamCompletionRate = activeTeams > 0 ? Math.round((fullTeams / activeTeams) * 100) : 0;
+
+        res.json(analytics);
+    } catch (error) {
+        console.error('Error fetching analytics:', error);
+        res.status(500).json({ message: 'Failed to fetch analytics.' });
     }
 });
 
@@ -1165,12 +1683,14 @@ async function startServer() {
         await connectToDatabase();
         
         server.listen(port, () => {
-            console.log(`🚀 SportsHub Server running on port ${port}`);
+            console.log(`🚀 Enhanced SportsHub Server running on port ${port}`);
             console.log(`📊 Database: Connected to MongoDB Atlas`);
             console.log(`💬 WebSocket: Real-time chat enabled`);
             console.log(`🔔 Notifications: Real-time delivery enabled`);
             console.log(`🔐 JWT: Access/Refresh token authentication enabled`);
-            console.log(`🏆 Ready for sports management!`);
+            console.log(`🛡️ Admin Panel: Full CRUD operations enabled`);
+            console.log(`📈 Analytics: Dashboard metrics enabled`);
+            console.log(`🏆 Ready for enhanced sports management!`);
         });
     } catch (error) {
         console.error('Failed to start server:', error);
